@@ -20,7 +20,7 @@ import type { Colors } from '../../constants.colors.js';
 import { CommitFormatter } from '../../git/formatters/commitFormatter.js';
 import {
 	getCommitAssociatedPullRequest,
-	getCommitAuthorAvatarUri,
+	getCommitAuthorIconUri,
 	getCommitEnrichedAutolinks,
 	getCommitGitUri,
 	getCommitsForFiles,
@@ -210,7 +210,9 @@ export class CommitNode extends ViewRefNode<'commit', ViewsWithCommits | FileHis
 				: this.unpublished
 					? new ThemeIcon('arrow-up', new ThemeColor('gitlens.unpublishedCommitIconColor' satisfies Colors))
 					: this.view.config.avatars
-						? await getCommitAuthorAvatarUri(this.commit, {
+						? // `getCommitAuthorIconUri` returns the rounded SVG when the raster can be fetched+wrapped
+							// within the timeout, otherwise the plain Uri, so the row always renders with an icon.
+							await getCommitAuthorIconUri(this.commit, {
 								defaultStyle: configuration.get('defaultGravatarsStyle'),
 							})
 						: undefined;

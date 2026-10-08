@@ -19,7 +19,7 @@ import { StatusFileFormatter } from '../../git/formatters/statusFormatter.js';
 import { GitUri } from '../../git/gitUri.js';
 import {
 	getCommitAssociatedPullRequest,
-	getCommitAuthorAvatarUri,
+	getCommitAuthorIconUri,
 	getCommitEnrichedAutolinks,
 	getCommitForFile,
 } from '../../git/utils/-webview/commit.utils.js';
@@ -189,7 +189,9 @@ export class FileRevisionAsCommitNode extends ViewRefFileNode<
 		if (!this.commit.isUncommitted && this.view.config.avatars) {
 			item.iconPath = this._options.unpublished
 				? new ThemeIcon('arrow-up', new ThemeColor('gitlens.unpublishedCommitIconColor' satisfies Colors))
-				: await getCommitAuthorAvatarUri(this.commit, {
+				: // `getCommitAuthorIconUri` returns the rounded SVG when the raster can be fetched+wrapped
+					// within the timeout, otherwise the plain Uri, so the row always renders with an icon.
+					await getCommitAuthorIconUri(this.commit, {
 						defaultStyle: configuration.get('defaultGravatarsStyle'),
 					});
 		}
@@ -277,6 +279,7 @@ export class FileRevisionAsCommitNode extends ViewRefFileNode<
 
 			item.command = this.getCommand();
 		}
+
 		item.tooltip ??= await this.getTooltip(token);
 		return item;
 	}

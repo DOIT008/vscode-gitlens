@@ -18,7 +18,7 @@ import { isUncommitted } from '@gitlens/git/utils/revision.utils.js';
 import { formatPlural } from '@gitlens/utils/plural.js';
 import { encodeHtmlWeak } from '@gitlens/utils/string.js';
 import type { EnrichedAutolink } from '../../../autolinks/models/autolinks.js';
-import { getAvatarUri, getCachedAvatarUri } from '../../../avatars.js';
+import { getAvatarUri, getCachedAvatarUri, getRoundedAvatarUri } from '../../../avatars.js';
 import type { CurrentUserNameStyle, GravatarDefaultStyle } from '../../../config.js';
 import { GlyphChars } from '../../../constants.js';
 import { Container } from '../../../container.js';
@@ -154,6 +154,53 @@ export function getCommitAuthorAvatarUri(
 ): Uri | Promise<Uri> {
 	if (commit.author.avatarUrl != null) return Uri.parse(commit.author.avatarUrl);
 	return getAvatarUri(commit.author.email, commit, options);
+}
+
+// Hard cap on how long `getCommitAuthorIconUri` will wait for the round-corner wrapping. Below this
+// the tree row waits; above it the plain (square) avatar is used so the row still renders quickly.
+const avatarRoundTimeoutMs = 2000;
+
+/**
+ * Resolves the author avatar and wraps it into a rounded-corner SVG data URI for native tree icons
+ * (`TreeItem.iconPath` can't be styled with CSS). Returns the plain Uri when the image can't be
+ * rounded or the wrapping times out, so callers always get something. `size` is the logical (css px)
+ * size; the image uses 2x for retina. Only http/https/data URIs qualify.
+ */
+export async function getCommitAuthorRoundedAvatarUri(
+	avatarUri: Uri,
+	options?: { size?: number },
+): Promise<Uri | undefined> {
+	return getRoundedAvatarUri(avatarUri, (options?.size ?? 16) * 2);
+}
+
+/**
+ * One-shot avatar resolver used by tree rows. Returns the rounded Uri when wrapping succeeds within
+ * `avatarRoundTimeoutMs` (data: sources succeed synchronously), otherwise the plain Uri, so the row
+ * never blocks longer than the timeout. Returns `undefined` when no avatar is available.
+ */
+export async function getCommitAuthorIconUri(
+	commit: GitCommit,
+	options?: { defaultStyle?: GravatarDefaultStyle; size?: number; timeoutMs?: number },
+): Promise<Uri | undefined> {
+	const plain = await getCommitAuthorAvatarUri(commit, options);
+	if (!(plain instanceof Uri)) return plain;
+
+	const size = (options?.size ?? 16) * 2;
+	if (plain.scheme !== 'https' && plain.scheme !== 'http' && plain.scheme !== 'data') {
+		return plain;
+	}
+
+	try {
+		const rounded = await Promise.race([
+			getRoundedAvatarUri(plain, size),
+			new Promise<undefined>(resolve =>
+				setTimeout(resolve, options?.timeoutMs ?? avatarRoundTimeoutMs, undefined),
+			),
+		]);
+		return rounded ?? plain;
+	} catch {
+		return plain;
+	}
 }
 
 export function getCommitAuthorCachedAvatarUri(commit: GitCommit, options?: { size?: number }): Uri | undefined {

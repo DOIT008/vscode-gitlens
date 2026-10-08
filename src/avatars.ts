@@ -347,6 +347,109 @@ export async function fetchAvatarImageAsDataUri(url: string): Promise<Uri | unde
 	}
 }
 
+// Rounded-corner avatars for native tree icons. `TreeItem.iconPath` is rendered by the host and
+// cannot be styled with CSS, so the rounding is baked into the image as an SVG data URI whose
+// `<clipPath>` rounds an embedded `<image>` — verified to render in VS Code native tree icons.
+const maxRoundedAvatarDataUriChars = 64 * 1024; // ~48 KB of raster bytes once base64-encoded
+// Success-only, session-scoped cache + in-flight de-dup. Kept separate from the persisted
+// `avatarCache` so we never store large SVG data URIs in avatar storage. Failures aren't cached,
+// so a slow first fetch can succeed on a later resolve.
+const roundedAvatarCache = new Map<string, Uri>();
+const roundedAvatarQueue = new Map<string, Promise<Uri | undefined>>();
+
+/**
+ * Wraps a raster avatar into an SVG data URI with proportional rounded corners (radius = size / 4).
+ * Returns `undefined` when the source isn't an https raster, can't be fetched, or is too large to
+ * wrap — callers should keep the plain avatar uri in that case (the row stays square, no blocking).
+ */
+export function getRoundedAvatarUri(uri: Uri, size: number = 32): Promise<Uri | undefined> {
+	const url = uri.toString(true);
+	if (!/^(https?|data):/i.test(url)) return Promise.resolve(undefined);
+
+	const key = `${url}:${size}`;
+	const cached = roundedAvatarCache.get(key);
+	if (cached != null) return Promise.resolve(cached);
+
+	let query = roundedAvatarQueue.get(key);
+	if (query == null) {
+		query = resolveRasterDataUri(url)
+			.then(raster => {
+				if (raster == null) {
+					console.log('[avatar-round] FETCH-NULL url=', url.slice(0, 90));
+					return undefined;
+				}
+
+				const rounded = buildRoundedAvatarSvg(raster, size);
+				console.log(
+					'[avatar-round] FETCH-OK chars=',
+					raster.length,
+					'→',
+					rounded == null ? 'SKIP(oversize>64KB)' : 'ROUNDED',
+				);
+				if (rounded != null) {
+					roundedAvatarCache.set(key, rounded);
+				}
+				return rounded;
+			})
+			.finally(() => roundedAvatarQueue.delete(key));
+		roundedAvatarQueue.set(key, query);
+	}
+	return query;
+}
+
+const rasterDataUriRegex = /^data:image\/(png|jpe?g|gif|webp);base64,/i;
+const maxRoundedFetchBytes = 512 * 1024;
+
+async function resolveRasterDataUri(url: string): Promise<string | undefined> {
+	if (url.startsWith('data:')) {
+		return rasterDataUriRegex.test(url) ? url : undefined;
+	}
+
+	try {
+		const rsp = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+		if (!rsp.ok) {
+			void rsp.body?.cancel();
+			return undefined;
+		}
+
+		if (!/^https?:/i.test(rsp.url)) {
+			void rsp.body?.cancel();
+			return undefined;
+		}
+
+		const contentType = rsp.headers.get('content-type')?.split(';')[0].trim().toLowerCase();
+		if (!rasterImageTypes.has(contentType ?? '')) {
+			void rsp.body?.cancel();
+			return undefined;
+		}
+
+		const contentLength = rsp.headers.get('content-length');
+		if (contentLength != null && parseInt(contentLength, 10) > maxRoundedFetchBytes) {
+			void rsp.body?.cancel();
+			return undefined;
+		}
+
+		const buffer = await rsp.arrayBuffer();
+		if (buffer.byteLength > maxRoundedFetchBytes) return undefined;
+		return `data:${contentType};base64,${base64(new Uint8Array(buffer))}`;
+	} catch {
+		return undefined;
+	}
+}
+
+function buildRoundedAvatarSvg(rasterDataUri: string, size: number): Uri | undefined {
+	// Keep the wrapped data URI small — it is re-sent to the renderer for every visible row
+	if (rasterDataUri.length > maxRoundedAvatarDataUriChars) return undefined;
+
+	const radius = Math.round(size / 4);
+	const svg =
+		`<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">` +
+		`<defs><clipPath id="r"><rect width="${size}" height="${size}" rx="${radius}" ry="${radius}"/></clipPath></defs>` +
+		`<image href="${rasterDataUri}" xlink:href="${rasterDataUri}" width="${size}" height="${size}" clip-path="url(#r)" preserveAspectRatio="none"/>` +
+		`</svg>`;
+	return Uri.parse(`data:image/svg+xml,${encodeURIComponent(svg)}`);
+}
+
 const presenceStatusColorMap = new Map<ContactPresenceStatus, string>([
 	['online', '#28ca42'],
 	['away', '#cecece'],
