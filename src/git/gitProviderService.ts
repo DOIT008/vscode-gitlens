@@ -1027,13 +1027,17 @@ export class GitProviderService implements UnifiedDisposable {
 			queueMicrotask(() => void this.visibility());
 		}
 
+		// [fork] 方案A：短路计划/仓库可见性门禁——本方法各分支的 allowed 一律置为 true。
+		// 原逻辑按 subscription.plan.effective.id 与仓库 visibility 判定，非付费计划的私有仓库会返回
+		// allowed:false；这里保留控制流、仅放开结果。账号未登录的门禁在 graphWebview.getState 的
+		// isAccountAccessRequired 处，不走这条链。恢复真实门禁：git 还原本方法即可。
 		const plan = subscription.plan.effective.id;
 		if (isSubscriptionPaidPlan(plan)) {
-			return { allowed: subscription.account?.verified !== false, subscription: { current: subscription } };
+			return { allowed: true, subscription: { current: subscription } };
 		}
 
 		if (feature != null && (isProFeatureOnAllRepos(feature) || isAdvancedFeature(feature))) {
-			return { allowed: false, subscription: { current: subscription, required: 'pro' } };
+			return { allowed: true, subscription: { current: subscription } };
 		}
 
 		function getRepoAccess(
@@ -1049,8 +1053,8 @@ export class GitProviderService implements UnifiedDisposable {
 					visibility => {
 						if (visibility === 'private') {
 							return {
-								allowed: false,
-								subscription: { current: subscription, required: 'pro' },
+								allowed: true,
+								subscription: { current: subscription },
 								visibility: visibility,
 							};
 						}
@@ -1074,7 +1078,7 @@ export class GitProviderService implements UnifiedDisposable {
 		if (repoPath == null) {
 			const repositories = this.openRepositories;
 			if (repositories.length === 0) {
-				return { allowed: false, subscription: { current: subscription } };
+				return { allowed: true, subscription: { current: subscription } };
 			}
 
 			if (repositories.length === 1) {
@@ -1085,8 +1089,8 @@ export class GitProviderService implements UnifiedDisposable {
 			switch (visibility) {
 				case 'private':
 					return {
-						allowed: false,
-						subscription: { current: subscription, required: 'pro' },
+						allowed: true,
+						subscription: { current: subscription },
 						visibility: 'private',
 					};
 				case 'mixed':
