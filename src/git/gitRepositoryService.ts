@@ -234,13 +234,20 @@ export class GitRepositoryService {
 			}
 
 			if (options?.pills) {
+				const pillClass = typeof options.pills === 'object' ? ` class="${options.pills.cssClass}"` : '';
 				return results
-					.map(
-						t =>
-							/*html*/ `<span style="color:#ffffff;background-color:#1d76db;border-radius:3px;"${
-								typeof options.pills === 'object' ? ` class="${options.pills.cssClass}"` : ''
-							}>&nbsp;${t}&nbsp;&nbsp;</span>`,
-					)
+					.map(t => {
+						// Shrink the leading icon to sit better with the pill's label text. The `$(…)` token renders
+						// differently per surface, so cover both: in a native MarkdownString hover it becomes a
+						// `.codicon` that uses `font-size: inherit` (shrunk by the wrapper's `font-size`); in the graph
+						// webview it becomes a `<code-icon>` sized by `--code-icon-size` (default 16px), so we also pin
+						// that to `1em` to resolve against the same shrunk wrapper size.
+						const content = t.replace(
+							/\$\(([^)~]+)\)/,
+							icon => /*html*/ `<span style="font-size:0.85em;--code-icon-size:1em">${icon}</span>`,
+						);
+						return /*html*/ `<span${pillClass} style="color:#ffffff;background-color:#1d76db;border-radius:3px;padding:0 0.5em 0.25em;line-height:1;">${content}</span>`;
+					})
 					.join('&nbsp;&nbsp;');
 			}
 			return results.join(', ');
