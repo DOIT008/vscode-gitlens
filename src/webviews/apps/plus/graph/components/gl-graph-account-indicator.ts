@@ -39,7 +39,6 @@ import '@gitlens/components/components/overlays/popover.js';
 import '../../../shared/components/progress-ring.js';
 import './account/account-chip.js';
 import './account/agents-chip.js';
-import './account/ai-chip.js';
 import './account/integrations-chip.js';
 
 declare global {
@@ -436,8 +435,8 @@ export class GlGraphAccountIndicator extends SignalWatcher(LitElement) {
 		return (state?.enabled ?? false) && (state?.orgEnabled ?? false);
 	}
 
-	/** Empty ⇒ offer the "Set up AI" CTA alongside the AI chip (see `renderAI`), and suppress the Agents
-	 *  section entirely (see `renderAgents`). */
+	/** Empty ⇒ suppress the Agents section entirely (see `renderAgents`); the AI section no longer
+	 *  renders in this build. */
 	private get aiEmpty(): boolean {
 		if (!this.loaded) return false;
 
@@ -499,7 +498,7 @@ export class GlGraphAccountIndicator extends SignalWatcher(LitElement) {
 					@gl-account-chip-feedback=${this.handleFeedbackClick}
 				></gl-account-chip>
 				<hr />
-				${this.renderAI()} ${this.renderAgents()}
+				${this.renderAgents()}
 				<div class="rollup__section">
 					<p class="rollup__heading">${l10n.t('Integrations')}</p>
 					${
@@ -539,29 +538,6 @@ export class GlGraphAccountIndicator extends SignalWatcher(LitElement) {
 			aria-label=${label}
 			>${label}</gl-button
 		>`;
-	}
-
-	/**
-	 * AI section — the chip (model row, credits row) and, when AI is off, a CTA alongside it.
-	 *
-	 * The CTA is ADDITIVE rather than a replacement, which is why this section doesn't gate on `aiEmpty`
-	 * the way Agents does: the credits row is subscription entitlement and has nothing to do with the
-	 * `gitlens.ai.enabled` setting, so gating the section would hide a user's remaining GitKraken AI
-	 * credits the moment they turned AI off — which is exactly when they might go looking for them. The
-	 * chip decides internally which of its two rows apply, so `aiEmpty` here only decides whether the
-	 * user is also offered a way to turn AI on.
-	 *
-	 * The CTA renders BEFORE the chip so it occupies the slot the model row would have taken, leaving the
-	 * credits row last either way — a CTA sitting under a populated row reads as applying to it.
-	 */
-	private renderAI(): unknown {
-		if (!this.loaded) return nothing;
-
-		return html`<div class="rollup__section">
-			<p class="rollup__heading">${l10n.t('AI')}</p>
-			${this.aiEmpty ? this.renderSetupCta('gitlens.showSettingsPage!ai', l10n.t('Set up AI')) : nothing}
-			<gl-ai-chip></gl-ai-chip>
-		</div>`;
 	}
 
 	/**

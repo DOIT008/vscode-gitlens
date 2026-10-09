@@ -363,8 +363,7 @@
 			}
 		},
 		"gitlens.ai.enable": {
-			"label": "Enable AI Features...",
-			"commandPalette": "gitlens:enabled && !gitlens:readonly && !gitlens:untrusted && gitlens:gk:organization:ai:enabled"
+			"label": "Enable AI Features..."
 		},
 		"gitlens.ai.explainBranch": {
 			"label": "Explain Branch Changes...",

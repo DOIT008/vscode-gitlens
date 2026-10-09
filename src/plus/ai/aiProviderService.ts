@@ -508,9 +508,13 @@ export class AIProviderService implements AIService, Disposable {
 		return this.enabled && this.orgEnabled;
 	}
 
-	/** Whether the user has enabled AI features (`gitlens.ai.enabled` setting). */
+	/** Whether the user has enabled AI features (`gitlens.ai.enabled` setting).
+	 *
+	 * Custom build: hard-disabled so every AI-gated surface — SCM generate-commit-message buttons,
+	 * graph sparkle actions, hovers, context menus, palette commands, agent status — stays hidden.
+	 * The `gitlens.ai.enabled` setting can no longer turn AI back on. */
 	get enabled(): boolean {
-		return configuration.get('ai.enabled', undefined, true);
+		return false;
 	}
 
 	/** Whether the org permits AI (GitKraken admin setting). Fail-open: defaults true until org settings load. */
