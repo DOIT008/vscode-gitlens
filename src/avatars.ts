@@ -362,11 +362,18 @@ const roundedAvatarQueue = new Map<string, Promise<Uri | undefined>>();
  * Returns `undefined` when the source isn't an https raster, can't be fetched, or is too large to
  * wrap — callers should keep the plain avatar uri in that case (the row stays square, no blocking).
  */
-export function getRoundedAvatarUri(uri: Uri, size: number = 32): Promise<Uri | undefined> {
+export function getRoundedAvatarUri(
+	uri: Uri,
+	size: number = 32,
+	options?: { encode?: 'percent' | 'base64' },
+): Promise<Uri | undefined> {
 	const url = uri.toString(true);
 	if (!/^(https?|data):/i.test(url)) return Promise.resolve(undefined);
 
-	const key = `${url}:${size}`;
+	// `base64` is required when the URI is embedded in a markdown `![]()` image (native hovers): the
+	// percent-encoded form leaves literal `(`/`)` from `url(#r)`, which would terminate the link early.
+	const encode = options?.encode ?? 'percent';
+	const key = `${url}:${size}:${encode}`;
 	const cached = roundedAvatarCache.get(key);
 	if (cached != null) return Promise.resolve(cached);
 
@@ -379,7 +386,7 @@ export function getRoundedAvatarUri(uri: Uri, size: number = 32): Promise<Uri | 
 					return undefined;
 				}
 
-				const rounded = buildRoundedAvatarSvg(raster, size);
+				const rounded = buildRoundedAvatarSvg(raster, size, encode);
 				console.log(
 					'[avatar-round] FETCH-OK chars=',
 					raster.length,
@@ -437,7 +444,11 @@ async function resolveRasterDataUri(url: string): Promise<string | undefined> {
 	}
 }
 
-function buildRoundedAvatarSvg(rasterDataUri: string, size: number): Uri | undefined {
+function buildRoundedAvatarSvg(
+	rasterDataUri: string,
+	size: number,
+	encode: 'percent' | 'base64' = 'percent',
+): Uri | undefined {
 	// Keep the wrapped data URI small — it is re-sent to the renderer for every visible row
 	if (rasterDataUri.length > maxRoundedAvatarDataUriChars) return undefined;
 
@@ -447,7 +458,11 @@ function buildRoundedAvatarSvg(rasterDataUri: string, size: number): Uri | undef
 		`<defs><clipPath id="r"><rect width="${size}" height="${size}" rx="${radius}" ry="${radius}"/></clipPath></defs>` +
 		`<image href="${rasterDataUri}" xlink:href="${rasterDataUri}" width="${size}" height="${size}" clip-path="url(#r)" preserveAspectRatio="none"/>` +
 		`</svg>`;
-	return Uri.parse(`data:image/svg+xml,${encodeURIComponent(svg)}`);
+	return Uri.parse(
+		encode === 'base64'
+			? `data:image/svg+xml;base64,${base64(svg)}`
+			: `data:image/svg+xml,${encodeURIComponent(svg)}`,
+	);
 }
 
 const presenceStatusColorMap = new Map<ContactPresenceStatus, string>([

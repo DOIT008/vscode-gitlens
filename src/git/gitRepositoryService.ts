@@ -246,7 +246,10 @@ export class GitRepositoryService {
 							/\$\(([^)~]+)\)/,
 							icon => /*html*/ `<span style="font-size:0.85em;--code-icon-size:1em">${icon}</span>`,
 						);
-						return /*html*/ `<span${pillClass} style="color:#ffffff;background-color:#1d76db;border-radius:3px;padding:0 0.5em 0.25em;line-height:1;">${content}</span>`;
+						// `line-height:1` keeps a single pill's top tight but also collapses the gap between wrapped
+						// rows, so pills stack flush. `inline-block` + `margin-bottom` restores that row spacing (and
+						// keeps each pill intact when it wraps) without re-opening the top gap.
+						return /*html*/ `<span${pillClass} style="color:#ffffff;background-color:#1d76db;border-radius:3px;padding:0.1em 0.5em 0.35em;line-height:1;display:inline-block;vertical-align:middle;margin-bottom:0.2em;">${content}</span>`;
 					})
 					.join('&nbsp;&nbsp;');
 			}

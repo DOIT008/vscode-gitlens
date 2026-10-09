@@ -180,7 +180,12 @@ export async function getCommitAuthorRoundedAvatarUri(
  */
 export async function getCommitAuthorIconUri(
 	commit: GitCommit,
-	options?: { defaultStyle?: GravatarDefaultStyle; size?: number; timeoutMs?: number },
+	options?: {
+		defaultStyle?: GravatarDefaultStyle;
+		size?: number;
+		timeoutMs?: number;
+		encode?: 'percent' | 'base64';
+	},
 ): Promise<Uri | undefined> {
 	const plain = await getCommitAuthorAvatarUri(commit, options);
 	if (!(plain instanceof Uri)) return plain;
@@ -192,7 +197,7 @@ export async function getCommitAuthorIconUri(
 
 	try {
 		const rounded = await Promise.race([
-			getRoundedAvatarUri(plain, size),
+			getRoundedAvatarUri(plain, size, { encode: options?.encode }),
 			new Promise<undefined>(resolve =>
 				setTimeout(resolve, options?.timeoutMs ?? avatarRoundTimeoutMs, undefined),
 			),

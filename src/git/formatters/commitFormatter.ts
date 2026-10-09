@@ -52,6 +52,7 @@ import {
 	formatCommitStats,
 	formatCurrentUserDisplayName,
 	getCommitAuthorAvatarUri,
+	getCommitAuthorIconUri,
 	getCommitGitUri,
 } from '../utils/-webview/commit.utils.js';
 import { getIssueOrPullRequestMarkdownIcon } from '../utils/-webview/icons.js';
@@ -475,12 +476,17 @@ export class CommitFormatter extends Formatter<GitCommit, CommitFormatOptions> {
 
 	private async _getAvatar(outputFormat: 'html' | 'markdown', title: string, size?: number) {
 		size = size ?? configuration.get('hovers.avatarSize');
-		const avatarPromise = getCommitAuthorAvatarUri(this._item, {
-			defaultStyle: configuration.get('defaultGravatarsStyle'),
-			size: size,
-		});
+		const avatarOptions = { defaultStyle: configuration.get('defaultGravatarsStyle'), size: size };
 
-		const src = (await avatarPromise).toString(true);
+		// Native markdown hovers strip `<img>` CSS, so the rounding must be baked into the image itself.
+		// `base64` keeps the data URI free of `)` which would otherwise break `![]()` parsing. HTML output
+		// (webviews) keeps the plain avatar — those surfaces round via CSS.
+		const avatar =
+			outputFormat === 'markdown'
+				? await getCommitAuthorIconUri(this._item, { ...avatarOptions, encode: 'base64' })
+				: await getCommitAuthorAvatarUri(this._item, avatarOptions);
+
+		const src = (avatar ?? (await getCommitAuthorAvatarUri(this._item, avatarOptions))).toString(true);
 		const htmlTitle = encodeHtmlWeak(title);
 		const markdownTitle = escapeMarkdown(title);
 		const markdownLinkTitle = escapeMarkdownTooltip(title);
