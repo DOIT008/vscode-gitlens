@@ -6091,7 +6091,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 								this._pendingSidebarPanel != null ||
 								((configuration.get('graph.sidebar.pinned') ?? false) &&
 									(storedPanels?.sidebar?.visible ?? true)),
-							activePanel: this._pendingSidebarPanel ?? storedPanels?.sidebar?.activePanel,
+							// Custom build: the Agents panel was removed, so a persisted `agents` selection
+							// from a previous session falls back to Overview instead of restoring a panel
+							// that no longer exists in the rail.
+							activePanel:
+								this._pendingSidebarPanel ??
+								(storedPanels?.sidebar?.activePanel === 'agents'
+									? 'overview'
+									: storedPanels?.sidebar?.activePanel),
 						},
 					}
 				: undefined),

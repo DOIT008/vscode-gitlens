@@ -18,9 +18,10 @@ function noOpenDialogGuard(e: KeyboardEvent): boolean {
 	return !e.composedPath().some(el => (el as HTMLElement).tagName === 'DIALOG' && (el as HTMLDialogElement).open);
 }
 
-/** `keys` chord list for the sidebar-panel digit shortcut — `Alt+1`-`8` (code-token chords, so the
- *  physical numeric-row keys, regardless of the digit's shifted symbol). Eight because that's the
- *  panel count in `sidebarPanelOrder`; the display-mode toggles have their own letter chords.
+/** `keys` chord list for the sidebar-panel digit shortcut — `Alt+1`-`7` (code-token chords, so the
+ *  physical numeric-row keys, regardless of the digit's shifted symbol). Seven because that's the
+ *  panel count in `sidebarPanelOrder` (custom build: `agents` dropped); the display-mode toggles
+ *  have their own letter chords.
  *  Alt+digit shadows VS Code's `workbench.action.openEditorAtIndex`, but this webview's keydown handler
  *  calls `preventDefault` on a matched chord, which suppresses that at the OS/host layer too (verified
  *  live against a running instance). */
@@ -32,7 +33,6 @@ const sidebarAltDigitKeys = [
 	'alt+Digit5',
 	'alt+Digit6',
 	'alt+Digit7',
-	'alt+Digit8',
 ];
 
 /** One-time-bound view of the host state/actions the graph webview's shortcuts dispatch to. Built ONCE
@@ -208,7 +208,7 @@ export function registerGraphKeymap(keymap: KeymapDispatcher<GraphKeymapScope>, 
 				group: 'panels',
 				label: l10n.t('Toggle a side bar panel'),
 				order: 1,
-				keysOverride: ['alt+Digit1', 'sep:…', 'Digit8'],
+				keysOverride: ['alt+Digit1', 'sep:…', 'Digit7'],
 			},
 			run: (_e, chordIndex) => {
 				const panel = visibleSidebarPanels(actions.isVirtualRepo())[chordIndex];

@@ -57,6 +57,7 @@ const anchorAliases: Record<string, string> = {
  */
 export const droppedAnchorQueries: Record<string, string> = {
 	ai: 'gitlens.ai',
+	agents: 'gitlens.ai',
 	'file-annotations': 'gitlens.fileAnnotations',
 	'repositories-view': 'gitlens.views.repositories',
 	'branches-view': 'gitlens.views.branches',

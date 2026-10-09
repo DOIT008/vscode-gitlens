@@ -1,10 +1,12 @@
 import type { GraphDisplayMode, GraphSidebarPanel } from '../../../../plus/graph/protocol.js';
 
 /** Canonical rail order — the single source of truth for both the rail's icon layout
- *  (`sidebar.ts`) and the Shift+1-8 keyboard-shortcut numbering (`graph-app.ts`). */
+ *  (`sidebar.ts`) and the Shift+1-8 keyboard-shortcut numbering (`graph-app.ts`).
+ *
+ *  Custom build: `agents` removed — the Agents panel has no rail entry, so it can only be
+ *  reached by a persisted selection from a previous session (normalized away in `sidebar-panel`). */
 export const sidebarPanelOrder: readonly GraphSidebarPanel[] = [
 	'overview',
-	'agents',
 	'pullRequests',
 	'worktrees',
 	'branches',

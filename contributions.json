@@ -342,8 +342,7 @@
 			"commandPalette": "gitlens:enabled && !gitlens:readonly && !gitlens:untrusted && gitlens:ai:allowed"
 		},
 		"gitlens.ai.connectAgents": {
-			"label": "Connect AI Agents (Install MCP and Hooks)",
-			"commandPalette": "!gitlens:untrusted && gitlens:gk:cli:installed"
+			"label": "Connect AI Agents (Install MCP and Hooks)"
 		},
 		"gitlens.ai.continueRebase": {
 			"label": "Continue with Auto-Rebase",
@@ -716,19 +715,16 @@
 			}
 		},
 		"gitlens.ai.mcp.install": {
-			"label": "Install GitKraken MCP Server",
-			"commandPalette": "!gitlens:untrusted && !gitlens:gk:cli:installed"
+			"label": "Install GitKraken MCP Server"
 		},
 		"gitlens.ai.mcp.installForAgent": {
 			"label": "Install GitKraken MCP for Agent"
 		},
 		"gitlens.ai.mcp.installForAllAgents": {
-			"label": "Connect GitKraken MCP to All Detected Agents",
-			"commandPalette": "!gitlens:untrusted && gitlens:gk:cli:installed"
+			"label": "Connect GitKraken MCP to All Detected Agents"
 		},
 		"gitlens.ai.mcp.reinstall": {
-			"label": "Reinstall GitKraken MCP Server",
-			"commandPalette": "!gitlens:untrusted && gitlens:gk:cli:installed"
+			"label": "Reinstall GitKraken MCP Server"
 		},
 		"gitlens.ai.mcp.uninstallForAgent": {
 			"label": "Uninstall GitKraken MCP for Agent"

@@ -7105,8 +7105,7 @@
 			},
 			{
 				"command": "gitlens.ai.connectAgents",
-				"title": "%command.gitlens.ai.connectAgents.title%",
-				"category": "%command.category%"
+				"title": "%command.gitlens.ai.connectAgents.title%"
 			},
 			{
 				"command": "gitlens.ai.continueRebase",
@@ -7249,8 +7248,7 @@
 			},
 			{
 				"command": "gitlens.ai.mcp.install",
-				"title": "%command.gitlens.ai.mcp.install.title%",
-				"category": "%command.category%"
+				"title": "%command.gitlens.ai.mcp.install.title%"
 			},
 			{
 				"command": "gitlens.ai.mcp.installForAgent",
@@ -7258,13 +7256,11 @@
 			},
 			{
 				"command": "gitlens.ai.mcp.installForAllAgents",
-				"title": "%command.gitlens.ai.mcp.installForAllAgents.title%",
-				"category": "%command.category%"
+				"title": "%command.gitlens.ai.mcp.installForAllAgents.title%"
 			},
 			{
 				"command": "gitlens.ai.mcp.reinstall",
-				"title": "%command.gitlens.ai.mcp.reinstall.title%",
-				"category": "%command.category%"
+				"title": "%command.gitlens.ai.mcp.reinstall.title%"
 			},
 			{
 				"command": "gitlens.ai.mcp.uninstallForAgent",
@@ -13553,7 +13549,7 @@
 				},
 				{
 					"command": "gitlens.ai.connectAgents",
-					"when": "!gitlens:untrusted && gitlens:gk:cli:installed"
+					"when": "false"
 				},
 				{
 					"command": "gitlens.ai.continueRebase",
@@ -13669,7 +13665,7 @@
 				},
 				{
 					"command": "gitlens.ai.mcp.install",
-					"when": "!gitlens:untrusted && !gitlens:gk:cli:installed"
+					"when": "false"
 				},
 				{
 					"command": "gitlens.ai.mcp.installForAgent",
@@ -13677,11 +13673,11 @@
 				},
 				{
 					"command": "gitlens.ai.mcp.installForAllAgents",
-					"when": "!gitlens:untrusted && gitlens:gk:cli:installed"
+					"when": "false"
 				},
 				{
 					"command": "gitlens.ai.mcp.reinstall",
-					"when": "!gitlens:untrusted && gitlens:gk:cli:installed"
+					"when": "false"
 				},
 				{
 					"command": "gitlens.ai.mcp.uninstallForAgent",

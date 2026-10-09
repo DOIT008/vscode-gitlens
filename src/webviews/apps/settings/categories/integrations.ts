@@ -6,25 +6,6 @@ const defaultBranchNameFormat = '${id}-${title}';
 
 export const integrationsCategories: SettingsCategory[] = [
 	{
-		id: 'agents',
-		settingsSearch: 'gitlens.ai',
-		name: l10n.t('Agents'),
-		group: 'Integrations',
-		icon: 'robot',
-		hint: l10n.t('Set your default coding agent, and install GitKraken MCP and hooks for supported agents'),
-		learnMoreUrl: 'https://help.gitkraken.com/gitlens/gl-gk-ai/',
-		controls: [
-			{
-				kind: 'agents',
-				label: l10n.t('Agents'),
-				// Search text — the rendered rows come from the Agents RPC service
-				hint: l10n.t(
-					'Chat, extension, and CLI agents, default agent, GitKraken MCP, agent hooks, Copilot, Cursor, Codex, Gemini, opencode',
-				),
-			},
-		],
-	},
-	{
 		id: 'integrations',
 		settingsSearch: 'gitlens.integrations',
 		name: l10n.t('Cloud Integrations'),
