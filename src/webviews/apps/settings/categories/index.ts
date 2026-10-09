@@ -56,6 +56,7 @@ const anchorAliases: Record<string, string> = {
  * so a dropped category can never silently orphan its command.
  */
 export const droppedAnchorQueries: Record<string, string> = {
+	ai: 'gitlens.ai',
 	'file-annotations': 'gitlens.fileAnnotations',
 	'repositories-view': 'gitlens.views.repositories',
 	'branches-view': 'gitlens.views.branches',

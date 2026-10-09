@@ -407,10 +407,9 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 		const steps = [
 			this.signInStep(0),
 			this.integrationsStep(1),
-			this.aiStep(2),
-			this.agentsStep(3),
-			this.walkthroughStep(4),
-			this.graphWalkthroughStep(5),
+			this.agentsStep(2),
+			this.walkthroughStep(3),
+			this.graphWalkthroughStep(4),
 		];
 		const done = steps.filter(s => s.state === 'done').length;
 		const total = steps.length;
@@ -538,43 +537,6 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			action: done ? l10n.t('Connect More') : l10n.t('Connect'),
 			actionVariant: done ? 'quiet' : 'primary',
 			nav: 'integrations',
-		};
-	}
-
-	private aiStep(index: number): SetupStep {
-		const ai = this._state.aiState.get();
-		const model = this._state.aiModel.get();
-		const base = {
-			key: 'ai',
-			accent: this.accent(index),
-			title: l10n.t('Let AI review, compose, and resolve for you'),
-			why: l10n.t(
-				'Auto-compose a sprawling working tree into logical commits, get a review pass before you push, resolve conflicts, and explain unfamiliar history - with whatever model you pick.',
-			),
-			nav: 'ai',
-		} as const;
-
-		if (ai?.orgEnabled === false) {
-			return {
-				...base,
-				icon: 'sparkle',
-				state: 'todo',
-				status: l10n.t('Disabled by your GitKraken admin'),
-				action: l10n.t('Open AI'),
-				actionVariant: 'primary',
-			};
-		}
-
-		const done = model != null;
-		return {
-			...base,
-			icon: done ? 'sparkle-filled' : 'sparkle',
-			state: done ? 'done' : 'todo',
-			status: done
-				? l10n.t('{0} · {1}', model.provider.name, model.name)
-				: l10n.t('No provider or model selected'),
-			action: done ? l10n.t('Change Model') : l10n.t('Choose Model'),
-			actionVariant: done ? 'quiet' : 'primary',
 		};
 	}
 

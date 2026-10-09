@@ -6,29 +6,6 @@ const defaultBranchNameFormat = '${id}-${title}';
 
 export const integrationsCategories: SettingsCategory[] = [
 	{
-		id: 'ai',
-		settingsSearch: 'gitlens.ai',
-		name: l10n.t('AI'),
-		group: 'Integrations',
-		icon: 'sparkle',
-		hint: l10n.t(
-			'Composing commits, reviewing changes, resolving conflicts, explaining history, and power other AI features across GitLens',
-		),
-		learnMoreUrl: 'https://help.gitkraken.com/gitlens/gl-gk-ai/',
-		master: {
-			kind: 'check',
-			key: 'ai.enabled',
-			label: l10n.t('AI Features'),
-		},
-		controls: [
-			{
-				kind: 'ai',
-				label: l10n.t('AI integrations'),
-				hint: l10n.t('AI provider, model, compose model, review model, conflict resolution model'),
-			},
-		],
-	},
-	{
 		id: 'agents',
 		settingsSearch: 'gitlens.ai',
 		name: l10n.t('Agents'),
