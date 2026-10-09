@@ -87,6 +87,14 @@ export class GlMarkdown extends LitElement {
 				min-width: 0;
 			}
 
+			/* The hover formats' avatar is a square raster; round its corners proportionally (radius =
+			   size / 4) so it matches the other avatar surfaces and never degenerates into a full circle
+			   at the small sizes hovers use. Scoped to the leading avatar only — the presence dot lives in
+			   the second column and keeps its own shape. */
+			:host([avatar-column]) p:has(> img:first-child + .lead-image-body) > img:first-child {
+				border-radius: 25%;
+			}
+
 			:where(:host([density='compact'])) p,
 			:where(:host([density='compact'])) .code,
 			:where(:host([density='compact'])) ul,
