@@ -51,6 +51,7 @@ export interface Config {
 	readonly sortRepositoriesBy: RepositoriesSorting;
 	readonly sortWorktreesBy: WorktreeSorting;
 	readonly sortWorkingChangesBy: WorkingChangesSorting;
+	readonly startWork: { readonly branchNameFormat: string };
 	readonly statusBar: StatusBarConfig;
 	readonly strings: StringsConfig;
 	readonly telemetry: TelemetryConfig;
@@ -1064,7 +1065,7 @@ export interface RepositoriesViewConfig {
 
 export interface SearchAndCompareViewConfig {
 	readonly avatars: boolean;
-	readonly files: ViewsFilesConfig;
+	readonly files: ViewsFilesConfig & { readonly openDiffOnClick: boolean };
 	readonly pullRequests: {
 		readonly enabled: boolean;
 		readonly showForCommits: boolean;

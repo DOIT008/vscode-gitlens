@@ -1659,6 +1659,20 @@
 				}
 			},
 			{
+				"id": "start-work",
+				"title": "%config.section.start-work.title%",
+				"order": 55,
+				"properties": {
+					"gitlens.startWork.branchNameFormat": {
+						"type": "string",
+						"default": "${id}-${title}",
+						"markdownDescription": "%config.startWork.branchNameFormat.markdownDescription%",
+						"scope": "window",
+						"order": 10
+					}
+				}
+			},
+			{
 				"id": "launchpad",
 				"title": "%config.section.launchpad.title%",
 				"order": 60,
@@ -3688,6 +3702,13 @@
 						"markdownDescription": "%config.views.searchAndCompare.files.compact.markdownDescription%",
 						"scope": "window",
 						"order": 22
+					},
+					"gitlens.views.searchAndCompare.files.openDiffOnClick": {
+						"type": "boolean",
+						"default": true,
+						"markdownDescription": "%config.views.searchAndCompare.files.openDiffOnClick.markdownDescription%",
+						"scope": "window",
+						"order": 23
 					},
 					"gitlens.views.searchAndCompare.files.icon": {
 						"type": "string",
