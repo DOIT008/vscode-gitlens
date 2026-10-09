@@ -6549,90 +6549,90 @@
 				"id": "gitlens.graphLane1Color",
 				"description": "%color.gitlens.graphLane1Color.description%",
 				"defaults": {
-					"light": "#15a0bf",
-					"dark": "#18D1D1",
-					"highContrast": "#18D1D1"
+					"light": "#0E9999",
+					"dark": "#15BFBF",
+					"highContrast": "#15BFBF"
 				}
 			},
 			{
 				"id": "gitlens.graphLane2Color",
 				"description": "%color.gitlens.graphLane2Color.description%",
 				"defaults": {
-					"light": "#0669f7",
-					"dark": "#45C6FE",
-					"highContrast": "#45C6FE"
+					"light": "#E14660",
+					"dark": "#FE7686",
+					"highContrast": "#FE7686"
 				}
 			},
 			{
 				"id": "gitlens.graphLane3Color",
 				"description": "%color.gitlens.graphLane3Color.description%",
 				"defaults": {
-					"light": "#8e00c2",
-					"dark": "#98B5FE",
-					"highContrast": "#98B5FE"
+					"light": "#0D92C2",
+					"dark": "#14B6F1",
+					"highContrast": "#14B6F1"
 				}
 			},
 			{
 				"id": "gitlens.graphLane4Color",
 				"description": "%color.gitlens.graphLane4Color.description%",
 				"defaults": {
-					"light": "#c517b6",
-					"dark": "#C9A1FE",
-					"highContrast": "#C9A1FE"
+					"light": "#CE640B",
+					"dark": "#FE801F",
+					"highContrast": "#FE801F"
 				}
 			},
 			{
 				"id": "gitlens.graphLane5Color",
 				"description": "%color.gitlens.graphLane5Color.description%",
 				"defaults": {
-					"light": "#d90171",
-					"dark": "#F58FD7",
-					"highContrast": "#F58FD7"
+					"light": "#537BF7",
+					"dark": "#81A4FD",
+					"highContrast": "#81A4FD"
 				}
 			},
 			{
 				"id": "gitlens.graphLane6Color",
 				"description": "%color.gitlens.graphLane6Color.description%",
 				"defaults": {
-					"light": "#cd0101",
-					"dark": "#FE949D",
-					"highContrast": "#FE949D"
+					"light": "#A6800B",
+					"dark": "#CFA011",
+					"highContrast": "#CFA011"
 				}
 			},
 			{
 				"id": "gitlens.graphLane7Color",
 				"description": "%color.gitlens.graphLane7Color.description%",
 				"defaults": {
-					"light": "#f25d2e",
-					"dark": "#FE9B5E",
-					"highContrast": "#FE9B5E"
+					"light": "#9E62E2",
+					"dark": "#BD8AFD",
+					"highContrast": "#BD8AFD"
 				}
 			},
 			{
 				"id": "gitlens.graphLane8Color",
 				"description": "%color.gitlens.graphLane8Color.description%",
 				"defaults": {
-					"light": "#f2ca33",
-					"dark": "#E0B027",
-					"highContrast": "#E0B027"
+					"light": "#76940B",
+					"dark": "#94B811",
+					"highContrast": "#94B811"
 				}
 			},
 			{
 				"id": "gitlens.graphLane9Color",
 				"description": "%color.gitlens.graphLane9Color.description%",
 				"defaults": {
-					"light": "#7bd938",
-					"dark": "#A6C750",
-					"highContrast": "#A6C750"
+					"light": "#CB4EAB",
+					"dark": "#F171CF",
+					"highContrast": "#F171CF"
 				}
 			},
 			{
 				"id": "gitlens.graphLane10Color",
 				"description": "%color.gitlens.graphLane10Color.description%",
 				"defaults": {
-					"light": "#2ece9d",
-					"dark": "#4DD494",
-					"highContrast": "#4DD494"
+					"light": "#0E9F66",
+					"dark": "#15C681",
+					"highContrast": "#15C681"
 				}
 			},
 			{

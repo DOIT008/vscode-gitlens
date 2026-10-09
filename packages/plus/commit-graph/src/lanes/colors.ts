@@ -5,12 +5,12 @@
 // lightness — so nothing clamps (clamping would desaturate + drift brightness).
 //
 // Two tuned presets — flip `lanePalette` to switch + compare:
-//   • balanced — brighter, gentler saturation (the preferred "lighter" set).
+//   • balanced — the chosen default: mid lightness + moderate chroma (vivid, but never neon/glare).
 //   • vibrant  — lower lightness pushed to a higher chroma for punchier lanes.
 // Raise `lightness` for brighter/less-saturated lanes; raise `chromaTarget` for more vivid.
 const lanePalettePresets = {
-	balanced: { lightness: 0.78, chromaTarget: 0.15 },
-	vibrant: { lightness: 0.74, chromaTarget: 0.22 },
+	balanced: { lightness: 0.73, chromaTarget: 0.19 },
+	vibrant: { lightness: 0.7, chromaTarget: 0.22 },
 } as const;
 const laneHueStart = 195;
 const laneCount = 10;
@@ -73,16 +73,29 @@ function oklchToHex(l: number, c: number, hueDeg: number): string {
 }
 
 /**
- * Lane palette — every lane at the SAME OKLCH lightness, hues evenly spaced (starting near teal), each
- * pushed to its most-vivid in-gamut chroma (capped at `laneChromaTarget`). Equal perceived luminance
- * means no lane visually dominates or over-bleeds; hue + chroma distinguish them.
+ * Hue-slot order — interleave the two halves of the wheel so ADJACENT lanes land ~180°/144° apart
+ * (cool/warm alternation) instead of the sequential 36° steps. Sequential ordering piled lane2/3/4 into
+ * the blue-violet wedge, where the eye can't separate neighbouring branches; alternation makes every
+ * adjacent pair pop, which is what tracing one line across parallel columns depends on. For
+ * laneCount=10 the lane→slot order is 0,5,1,6,2,7,3,8,4,9.
+ */
+function hueSlotForLane(index: number): number {
+	const half = Math.ceil(laneCount / 2);
+	return index % 2 === 0 ? index / 2 : half + (index - 1) / 2;
+}
+
+/**
+ * Lane palette — every lane at the SAME OKLCH lightness, hues evenly spaced around the wheel but assigned
+ * to lanes in alternating cool/warm order (see `hueSlotForLane`), each pushed to its most-vivid in-gamut
+ * chroma (capped at `chromaTarget`). Equal perceived luminance means no lane visually dominates or
+ * over-bleeds; the alternation is what keeps neighbouring lanes distinguishable.
  *
  * Exported so adornment providers (e.g. ref chips) can match the row's lane color and keep visual
  * continuity between the lane gutter and any per-row UI.
  */
 function buildLanePalette(preset: { lightness: number; chromaTarget: number }): string[] {
 	return Array.from({ length: laneCount }, (_, i) => {
-		const hue = laneHueStart + (360 / laneCount) * i;
+		const hue = laneHueStart + (360 / laneCount) * hueSlotForLane(i);
 		// 0.98 keeps a hair off the boundary so rounding never clamps (which would desaturate).
 		const c = Math.min(preset.chromaTarget, maxChromaForLightnessHue(preset.lightness, hue) * 0.98);
 		return oklchToHex(preset.lightness, c, hue);
