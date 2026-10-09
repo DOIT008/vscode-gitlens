@@ -244,7 +244,7 @@ export class GitRepositoryService {
 						// that to `1em` to resolve against the same shrunk wrapper size.
 						const content = t.replace(
 							/\$\(([^)~]+)\)/,
-							icon => /*html*/ `<span style="font-size:0.85em;--code-icon-size:1em">${icon}</span>`,
+							icon => /*html*/ `<span style="font-size:1em;--code-icon-size:1em">${icon}</span>`,
 						);
 						// `line-height:1` keeps a single pill's top tight but also collapses the gap between wrapped
 						// rows, so pills stack flush. `inline-block` + `margin-bottom` restores that row spacing (and
