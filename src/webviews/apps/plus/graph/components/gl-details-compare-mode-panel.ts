@@ -39,7 +39,6 @@ import { compareModePanelStyles } from './gl-details-compare-mode-panel.css.js';
 import { renderAutolinksStrip } from './shared-panel-templates.js';
 import { panelActionInputStyles, panelAutolinkStripStyles } from './shared-panel.css.js';
 import './gl-commit-row-item.js';
-import './gl-compare-ai-actions.js';
 import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/badges/badge.js';
 import '../../../shared/components/branch-name.js';
@@ -355,17 +354,6 @@ export class GlDetailsCompareModePanel extends LitElement {
 		return this.activeView === 'contributors' ? this.renderContributorsSection() : this.renderFileSection(files);
 	}
 
-	private renderEmbeddedAIActions() {
-		if (this.orgSettings?.ai === false) return nothing;
-
-		return html`<gl-compare-ai-actions
-			.explainBusy=${this.explainBusy}
-			.generateChangelogBusy=${this.generateChangelogBusy}
-			.orgSettings=${this.orgSettings}
-			.aiModel=${this.aiModel}
-		></gl-compare-ai-actions>`;
-	}
-
 	private renderAllFilesTab() {
 		// No autolinks row on the All Files tab — autolinks are derived from commits, and this
 		// tab shows only files. Ahead/Behind tabs each render their own scoped autolinks row.
@@ -380,7 +368,7 @@ export class GlDetailsCompareModePanel extends LitElement {
 					})}</span
 				>
 			</div>
-			${this.renderEmbeddedAIActions()}${this.renderRightPane(this.allFiles)}
+			${this.renderRightPane(this.allFiles)}
 		</div>`;
 	}
 
@@ -410,9 +398,7 @@ export class GlDetailsCompareModePanel extends LitElement {
 			.snap=${this.splitSnap}
 		>
 			<div slot="start" class="compare-split__start">${this.renderCommitList(commits)}</div>
-			<div slot="end" class="compare-split__end">
-				${this.renderAutolinksRow()}${this.renderEmbeddedAIActions()}${this.renderRightPane(files)}
-			</div>
+			<div slot="end" class="compare-split__end">${this.renderAutolinksRow()}${this.renderRightPane(files)}</div>
 		</gl-split-panel>`;
 	}
 

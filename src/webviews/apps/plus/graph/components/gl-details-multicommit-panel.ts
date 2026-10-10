@@ -39,7 +39,6 @@ import { multiCommitPanelStyles, panelActionInputStyles, panelHostStyles } from 
 import { renderAutolinksStrip } from './shared-panel-templates.js';
 import { panelAutolinkStripStyles } from './shared-panel.css.js';
 import '@gitlens/components/components/codeIcon.js';
-import './gl-compare-ai-actions.js';
 import '../../../shared/components/commit-sha.js';
 import '../../../shared/components/progress.js';
 import '@gitlens/components/components/commitStats.js';
@@ -253,7 +252,6 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 									? html`<div class="sub-panel-enter">${this.subPanelContent}</div>`
 									: html`<div class="compare-section">
 												${this.renderPoles()} ${this.renderAutolinksRow()}
-												${this.renderAIActions()}
 											</div>
 											<div class="compare-files">
 												<webview-pane-group flexible>
@@ -605,17 +603,6 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 
 	private handleEnrichAutolinks() {
 		this.dispatchEvent(new CustomEvent('enrich-autolinks', { bubbles: true, composed: true }));
-	}
-
-	private renderAIActions() {
-		if (this.orgSettings?.ai === false) return nothing;
-
-		return html`<gl-compare-ai-actions
-			.explainBusy=${this.explainBusy}
-			.generateChangelogBusy=${this.generateChangelogBusy}
-			.orgSettings=${this.orgSettings}
-			.aiModel=${this.aiModel}
-		></gl-compare-ai-actions>`;
 	}
 
 	private renderCommitStats(stats?: GitCommitStats, appearance?: 'pill') {
