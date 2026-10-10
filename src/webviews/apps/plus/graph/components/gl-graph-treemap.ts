@@ -628,7 +628,10 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 	}
 
 	private get mode(): TreemapMode {
-		return this.graphState.treemapMode ?? 'files';
+		// The Agent Activity treemap panel has been removed from the UI; fall back to Files for any
+		// persisted 'activity' selection so the panel below the toolbar never renders in that mode.
+		const mode = this.graphState.treemapMode ?? 'files';
+		return mode === 'activity' ? 'files' : mode;
 	}
 
 	private get showAllBranchesEffective(): boolean {

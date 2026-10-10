@@ -51,13 +51,7 @@ const visualizationConfigs: Record<VisualizationKey, VisualizationConfig> = {
  * picture; Health is status and actions, so grouping it with them would misread it — and placing it
  * ahead of `timeline` would move the default out of first position for every existing user.
  */
-const visualizationOrder: readonly VisualizationKey[] = [
-	'timeline',
-	'treemap-files',
-	'treemap-commits',
-	'treemap-activity',
-	'health',
-];
+const visualizationOrder: readonly VisualizationKey[] = ['timeline', 'treemap-files', 'treemap-commits', 'health'];
 
 export interface GraphVisualizationModeChangeDetail {
 	mode: VisualizationMode;
@@ -151,7 +145,11 @@ export class GlGraphVisualizationsSwitcher extends SignalWatcher(LitElement) {
 	}
 
 	private get treemapMode(): TreemapMode {
-		return this.graphState.treemapMode ?? 'files';
+		// The Agent Activity switcher button has been removed from the UI; treat any persisted
+		// 'activity' selection as 'files' so exactly one button stays pressed and the router never
+		// lands on the removed visualization.
+		const mode = this.graphState.treemapMode ?? 'files';
+		return mode === 'activity' ? 'files' : mode;
 	}
 
 	private get commitsUnavailable(): boolean {
