@@ -225,22 +225,11 @@ export function registerGraphKeymap(keymap: KeymapDispatcher<GraphKeymapScope>, 
 		// Alt+letter/digit types nothing on Windows/Linux and is safely reclaimable on macOS (see the
 		// `webviewGlobal` scope's registration comment for the Option-character cost); Shift+letter
 		// would type a real character into a focused input.
-		// The two display-mode toggles route through `toggleDisplayMode`, the same path the rail's
+		// The display-mode toggle routes through `toggleDisplayMode`, the same path the rail's
 		// bottom toggle click takes. Alt also drives the lane dim now, and none of these toggle actions
 		// is lane navigation, so each calls `suppressModifierChainUntilRelease()` right before acting.
-		{
-			// `alt+KeyK`, not `alt+KeyA`: Option+A produces å on macOS, a real letter for Scandinavian
-			// layouts, so K was chosen to avoid shadowing it.
-			id: 'modes.toggleKanban',
-			keys: ['alt+KeyK'],
-			scope: 'webviewGlobal',
-			sheet: { group: 'panels', label: l10n.t('Toggle Agent Kanban'), order: 2, keysOverride: ['alt+KeyK'] },
-			run: () => {
-				actions.graph()?.suppressModifierChainUntilRelease?.();
-				actions.toggleDisplayMode('kanban');
-				return true;
-			},
-		},
+		// Custom build: the `modes.toggleKanban` (alt+K) binding is removed alongside the Agent Kanban
+		// rail badge, so the kanban display mode is unreachable.
 		{
 			id: 'modes.toggleVisualizations',
 			keys: ['alt+KeyV'],

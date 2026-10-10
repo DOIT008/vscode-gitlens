@@ -29,12 +29,14 @@ export type SidebarRailEntry =
 	| { kind: 'displayMode'; mode: Exclude<GraphDisplayMode, 'graph'> };
 
 /** Full rail order for the current repo kind, in render order: panels, then the
- *  kanban toggle, then the visualizations toggle. Drives the rail's rendering
+ *  visualizations toggle. Drives the rail's rendering
  *  (`sidebar.ts`); the keyboard indexes `visibleSidebarPanels` instead, since the display-mode
- *  toggles have their own letter chords. */
+ *  toggles have their own letter chords.
+ *
+ *  Custom build: the `kanban` (Agent Kanban) toggle is removed — its rail badge and panel are gone,
+ *  and the `alt+K` chord was dropped from the keymap, so the mode is unreachable. */
 export function visibleSidebarRailEntries(virtual: boolean): readonly SidebarRailEntry[] {
 	const entries: SidebarRailEntry[] = visibleSidebarPanels(virtual).map(panel => ({ kind: 'panel', panel: panel }));
-	entries.push({ kind: 'displayMode', mode: 'kanban' });
 	entries.push({ kind: 'displayMode', mode: 'visualizations' });
 	return entries;
 }
