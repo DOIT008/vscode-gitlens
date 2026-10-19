@@ -6,17 +6,34 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ## [Unreleased]
 
+## [19.4.0] - 2026-10-15
+
 ### Added
 
+- Adds _Publish Repository_ to the _Commit Graph_ for a repository with no remotes &mdash; the header, _Working Changes_ panel, overview, and branch details now offer to create a hosted repository (through VS Code's publish flow) instead of a _Publish Branch_ that could only report "No remotes found"; the _Git Command Palette_'s _Push_ offers the same escape when there are no remotes
+  - Offers _Add Remote…_ beside _Publish Repository…_ in the push wizard and the _Working Changes_ next steps, for hosts VS Code can't publish to, and hides _Fetch_ while the repository has no remotes
 - Adds configurable branch names for _Start Work_ with `gitlens.startWork.branchNameFormat`, using `${id}` and `${title}` tokens, plus a format editor and live preview in GitLens Settings ([#5925](https://github.com/gitkraken/vscode-gitlens/issues/5925))
 
-- Adds _Jira Data Center_ to the integrations in _GitLens Settings_, so a self-hosted Jira Server or Data Center instance can be connected alongside Jira Cloud ([#5864](https://github.com/gitkraken/vscode-gitlens/issues/5864)). It connects through your GitKraken account like the other self-hosted integrations, and each configured host is its own connection. The rest of the wiring &mdash; the _Commit Graph_'s issue tracker picker, autolinks &mdash; is not there yet, so apart from branch associations a connected instance is not yet read anywhere else in GitLens
+- Adds connecting a self-hosted _Jira Data Center_ (or Jira Server) instance from the integrations in _GitLens Settings_ ([#5864](https://github.com/gitkraken/vscode-gitlens/issues/5864)) &mdash; it connects through your GitKraken account like the other self-hosted integrations, with each configured host as its own connection. For now, a connected instance is used only to show the issues associated with a branch; _Start Work_, autolinks, and the _Commit Graph_'s issue tracker picker don't support it yet
   - The _Commit Graph_'s check for whether any issue integration is connected now looks at every configured host of a self-hosted tracker, so disconnecting one host no longer turns off issue enrichment while another is still connected
   - Reads a branch's associated _Jira Data Center_ issues from the instance the association names, never from another configured host that happens to be primary ([#5872](https://github.com/gitkraken/vscode-gitlens/issues/5872))
 - Adds a `gitlens.views.searchAndCompare.files.openDiffOnClick` setting to specify whether to open the changes or the working file when clicking a file in the _Search & Compare_ view ([#1651](https://github.com/gitkraken/vscode-gitlens/issues/1651)) &mdash; thanks to [PR #2845](https://github.com/gitkraken/vscode-gitlens/pull/2845) by Steven Vaught ([@Svaught598](https://github.com/Svaught598)) and [PR #3583](https://github.com/gitkraken/vscode-gitlens/pull/3583) by Ehab Younes ([@EhabY](https://github.com/EhabY))
 
+### Changed
+
+- Changes the _Commit Graph_ to no longer require an account on public and local repos &mdash; signed-out users get the full graph with no prompts
+  - On privately hosted repos, a preview starts automatically on first open, with a persistent notice above the graph showing the time left, a _Sign In_ action, and a reminder that public and local repos stay free; the sign-in screen now appears only after the preview ends (or for unverified accounts)
+  - _Start Work_ and _Start Review_ now ask you to sign in up front instead of implicitly signing you in when connecting an integration
+  - Account surfaces get real signed-out states &mdash; the _GitLens Settings_ account panel shows a sign-in card and a _Sign in to use GitKraken AI_ line instead of blank cards, and its footer offers _Sign in_ instead of a _Manage subscription_ link that opened gk.dev signed out
+  - The merge-target status chip's potential-conflicts check now requires a trial or Pro subscription, like every other conflict check; ahead/behind counts and merged status stay available to everyone
+- Changes the _Commit Graph_ preview for privately hosted repos to one continuous 3-day window &mdash; previously three separate one-day sessions, each started manually with _Continue Preview_
+- Renames the `gitlens.views.publishRepository` command to `gitlens.publishRepository:views`; the old id still works but is deprecated
+
 ### Fixed
 
+- Fixes GitLens terminal links (commits, branches, tags, ranges, and git commands) not working in multi-repository workspaces &mdash; links now use the repository containing the terminal's working directory, when shell integration reports it ([#5986](https://github.com/gitkraken/vscode-gitlens/issues/5986)) &mdash; thanks to [PR #5196](https://github.com/gitkraken/vscode-gitlens/pull/5196) by yuezichong ([@qianxunslimg](https://github.com/qianxunslimg))
+- Fixes Pro feature gates and account surfaces still offering _Reactivate Pro Trial_ after the server refused the reactivation &mdash; once refused, they show the _Upgrade to Pro_ messaging instead ([#5987](https://github.com/gitkraken/vscode-gitlens/issues/5987))
+- Fixes _Push_ from the _Git Command Palette_ on a branch with no upstream showing a plain push confirmation (which then failed) instead of the publish step
 - Fixes pressing <kbd>Space</kbd> on a _Git Command Palette_ confirmation step breaking the command &mdash; e.g. _Delete Worktree_ would stop responding and never delete the worktree
 - Fixes force-deleting a worktree skipping the uncommitted-changes warning when GitLens couldn't check the worktree for changes &mdash; it now asks before deleting a worktree it couldn't check
 - Fixes a repository or worktree with no commits yet showing no changes when it has staged or modified files
@@ -29,6 +46,10 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Fixes _Start Work_ and _Launchpad_ reads covering only one host per supported self-managed provider ([#5873](https://github.com/gitkraken/vscode-gitlens/issues/5873)) &mdash; connected hosts are read independently, with open repository scopes kept on their matching host
 - Fixes _Launchpad_ mixing pins, snoozes, selections, and tree items between self-managed hosts whose pull requests share an identifier ([#5873](https://github.com/gitkraken/vscode-gitlens/issues/5873))
 - Fixes _Start Work_ and _Launchpad_ showing a raw `GraphqlResponseError` when GitHub's API rate limit is exhausted &mdash; they now report that the rate limit was reached and when to try again
+- Fixes the GitKraken MCP server staying in VS Code's _Configure Tools_ after turning off `gitlens.gitkraken.mcp.autoEnabled` or AI features ([#5961](https://github.com/gitkraken/vscode-gitlens/issues/5961))
+- Fixes _Start Work_, _Start Review_, and _Launchpad_ freezing after choosing _Open in an agent_ when agent detection stalls &mdash; the agent picker now opens right away while agents load, and agent detection gives up after 10 seconds instead of hanging, still offering the editor's chat and the _Claude Code_ extension
+- Fixes opening a renamed or added file from a comparison or a commit's file list &mdash; _Open File at Revision_, _Open File_, and file history now use the file's path at that revision, and the _Ahead_ files node no longer shows a rename as an added file ([#5975](https://github.com/gitkraken/vscode-gitlens/issues/5975))
+- Fixes the _Commit Graph_'s auto-fetch replacing `FETCH_HEAD` while a `git pull` you started is between its fetch and merge, which could make the pull merge the wrong changes
 
 ## [19.3.0] - 2026-10-01
 
@@ -7480,7 +7501,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 - Initial release but still heavily a work in progress.
 
-[unreleased]: https://github.com/gitkraken/vscode-gitlens/compare/v19.3.0...HEAD
+[unreleased]: https://github.com/gitkraken/vscode-gitlens/compare/v19.4.0...HEAD
+[19.4.0]: https://github.com/gitkraken/vscode-gitlens/compare/v19.3.0...gitkraken:v19.4.0
 [19.3.0]: https://github.com/gitkraken/vscode-gitlens/compare/v19.2.0...gitkraken:v19.3.0
 [19.2.0]: https://github.com/gitkraken/vscode-gitlens/compare/v19.1.0...gitkraken:v19.2.0
 [19.1.0]: https://github.com/gitkraken/vscode-gitlens/compare/v19.0.1...gitkraken:v19.1.0
