@@ -402,12 +402,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 	actions?: SettingsActions;
 
 	override render(): unknown {
-		const steps = [
-			this.signInStep(0),
-			this.integrationsStep(1),
-			this.walkthroughStep(2),
-			this.graphWalkthroughStep(3),
-		];
+		const steps = [this.signInStep(), this.integrationsStep(), this.walkthroughStep(), this.graphWalkthroughStep()];
 		const done = steps.filter(s => s.state === 'done').length;
 		const total = steps.length;
 
@@ -535,7 +530,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 		};
 	}
 
-	private walkthroughStep(index: number): SetupStep {
+	private walkthroughStep(): SetupStep {
 		return this.buildWalkthroughStep(
 			'walkthrough',
 			'gl-gitlens',
