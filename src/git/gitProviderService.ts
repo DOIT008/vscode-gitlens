@@ -46,7 +46,12 @@ import { getBlameRange } from '@gitlens/git/utils/blame.utils.js';
 import { calculateDistribution } from '@gitlens/git/utils/contributor.utils.js';
 import { getVisibilityCacheKey } from '@gitlens/git/utils/remote.utils.js';
 import { RepositoryInitWatcher } from '@gitlens/git/watching/initWatcher.js';
-import type { FileWatcher, FileWatchEvent, FileWatchingProvider } from '@gitlens/git/watching/provider.js';
+import type {
+	FileWatcher,
+	FileWatcherOptions,
+	FileWatchEvent,
+	FileWatchingProvider,
+} from '@gitlens/git/watching/provider.js';
 import type { RepositoryWatchService } from '@gitlens/git/watching/watchService.js';
 import { joinUnique } from '@gitlens/utils/array.js';
 import type { Deferrable } from '@gitlens/utils/debounce.js';
@@ -330,7 +335,10 @@ export class GitProviderService implements UnifiedDisposable {
 		this._cache = new Cache();
 
 		const watchingProvider = createWatchingProvider();
-		this._gitService = GitService.createSingleton(watchingProvider);
+		// `readFile` lets the watcher diff `.git/config` and deliver a write confined to `branch.<name>` sections
+		// (upstream, push remote, description, …) as `config` alone, instead of always pairing it with `remotes`. A
+		// read that fails (e.g. a virtual repo with no real `.git/config`) is treated as unconfined, as without it
+		this._gitService = GitService.createSingleton(watchingProvider, { readFile: readWatchedFile });
 		this._watchService = this._gitService.watchService!;
 		this._repositoryInitWatcher = new RepositoryInitWatcher(watchingProvider);
 
@@ -345,7 +353,14 @@ export class GitProviderService implements UnifiedDisposable {
 			// Forced changes (`forcedRepositoryChanges`) bypass the session, so the provider's own repo handler
 			// advances those instead — `fireChange` accepts `force` only for those, so the two sets are disjoint.
 			this._watchService.onDidChangeWorkingTree(repoPath => this._cache.onWorkingTreeChanged(repoPath)),
-			this._watchService.onDidChangeRepository(e => this._cache.onRepositoryChanged(e.repoPath, e.changes)),
+			// Announced kinds were evicted when core announced its write; evicting them again would discard what was
+			// re-read since
+			this._watchService.onDidChangeRepository(e => {
+				const changes = e.getUnannouncedChanges();
+				if (changes.length) {
+					this._cache.onRepositoryChanged(e.repoPath, changes);
+				}
+			}),
 			this._repositoryInitWatcher,
 			this._repositoryInitWatcher.onDidCreate(e => {
 				const f = workspace.getWorkspaceFolder(Uri.file(e.path));
@@ -2562,12 +2577,19 @@ function getEncoding(uri: Uri): string {
 	return configuration.getCore('files.encoding', uri) ?? 'utf8';
 }
 
+function readWatchedFile(path: string): Promise<Uint8Array> {
+	return Promise.resolve(workspace.fs.readFile(coerceUri(path)));
+}
+
 function createWatchingProvider(): FileWatchingProvider {
 	return {
+		// Excludes are ignored: the stable `createFileSystemWatcher` API can't take them, and VS Code's watcher already
+		// honours `files.watcherExclude` (core post-filters events either way)
 		createWatcher: function (
 			basePath: string,
 			pattern: string,
 			onEvent: (event: FileWatchEvent) => void,
+			_options?: FileWatcherOptions,
 		): FileWatcher {
 			const uri = coerceUri(basePath);
 			const watcher = workspace.createFileSystemWatcher(new RelativePattern(uri, pattern));

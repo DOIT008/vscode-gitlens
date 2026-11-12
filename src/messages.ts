@@ -40,6 +40,10 @@ export function showBlameInvalidIgnoreRevsFileWarningMessage(
 	);
 }
 
+export function showFileHasNoPreviousRevisionWarningMessage(fileName: string): Promise<MessageItem | undefined> {
+	return showMessage('info', l10n.t("{0} didn't exist before this change", fileName), undefined, null);
+}
+
 export function showCommitHasNoPreviousCommitWarningMessage(commit?: GitCommit): Promise<MessageItem | undefined> {
 	if (commit == null) {
 		return showMessage('info', l10n.t('There is no previous commit.'), 'suppressCommitHasNoPreviousCommitWarning');
@@ -146,9 +150,18 @@ function showGitCommandInTerminal(gitCommand: GitCommandContext, error: GitComma
 	terminal.show();
 }
 
-export async function showGitErrorMessage(error: Error | GitCommandError<any>, message?: string): Promise<void> {
+/**
+ * @param actions Extra buttons, shown ahead of the output channel/terminal ones (git command errors only); the
+ * chosen one is returned so the caller can act on it
+ */
+export async function showGitErrorMessage(
+	error: Error | GitCommandError<any>,
+	message?: string,
+	actions?: MessageItem[],
+): Promise<MessageItem | undefined> {
 	if (!GitCommandError.is(error)) {
-		return void showGenericErrorMessage(message ?? getPresentableErrorMessage(error));
+		void showGenericErrorMessage(message ?? getPresentableErrorMessage(error));
+		return undefined;
 	}
 
 	const { gitCommand } = error.details;
@@ -168,6 +181,7 @@ export async function showGitErrorMessage(error: Error | GitCommandError<any>, m
 			: l10n.t('{0} If the error persists, please enable debug logging and try again.', baseMessage),
 		undefined,
 		null,
+		...(actions ?? []),
 		...(gitCommand != null
 			? [openInTerminalAction, openOutputChannelOrEnableLogging]
 			: [openOutputChannelOrEnableLogging]),
@@ -175,7 +189,7 @@ export async function showGitErrorMessage(error: Error | GitCommandError<any>, m
 
 	if (result === openInTerminalAction) {
 		showGitCommandInTerminal(gitCommand, error);
-		return;
+		return undefined;
 	}
 
 	if (result === openOutputChannelOrEnableLogging) {
@@ -184,7 +198,10 @@ export async function showGitErrorMessage(error: Error | GitCommandError<any>, m
 		} else {
 			void executeCommand('gitlens.enableDebugLogging');
 		}
+		return undefined;
 	}
+
+	return result != null && actions?.includes(result) ? result : undefined;
 }
 
 export async function showBitbucketPRCommitLinksAppNotInstalledWarningMessage(revLink: string): Promise<void> {

@@ -14,6 +14,7 @@ import {
 } from '../constants.js';
 import type { GitHostIntegration } from '../models/gitHostIntegration.js';
 import type { Integration, IntegrationConnectedKey } from '../models/integration.js';
+import type { LinearIntegration } from '../providers/linear.js';
 // These domain checks come from `providers/models.ts` (already imported here) rather than the individual
 // provider modules: those read `providersMetadata[...]` synchronously at module init, so importing from them
 // while `providers/models.ts` is still loading triggers a TDZ on `providersMetadata`. Importing the shared
@@ -148,6 +149,11 @@ export function isNonExpiringZeroTokenIntegrationId(id: IntegrationIds): boolean
 	);
 }
 
+/** By id: the provider class is loaded lazily, so it can't be checked with `instanceof` here. */
+export function isLinearIntegration(integration: Integration): integration is LinearIntegration {
+	return integration.id === IssuesCloudHostIntegrationId.Linear;
+}
+
 export function isGitHostIntegration(integration: Integration): integration is GitHostIntegration {
 	return integration.type === 'git';
 }
@@ -184,6 +190,16 @@ export function isIssuesSelfManagedHostIntegrationId(id: IntegrationIds): id is 
  */
 export function isSelfManagedHostIntegrationId(id: IntegrationIds): id is SelfManagedHostIntegrationIds {
 	return isGitSelfManagedHostIntegrationId(id) || isIssuesSelfManagedHostIntegrationId(id);
+}
+
+/**
+ * Whether this id is Jira, Cloud or Data Center: the two share their project and site identity rules and the SDK's
+ * status mapper. Takes any string, as a provider reference's `id` is one.
+ */
+export function isJiraIntegrationId(
+	id: string,
+): id is IssuesCloudHostIntegrationId.Jira | IssuesSelfManagedHostIntegrationId.JiraServer {
+	return id === IssuesCloudHostIntegrationId.Jira || id === IssuesSelfManagedHostIntegrationId.JiraServer;
 }
 
 /**

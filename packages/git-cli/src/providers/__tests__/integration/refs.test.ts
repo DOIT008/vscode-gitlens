@@ -88,6 +88,24 @@ suite('RefsSubProvider', () => {
 		assert.strictEqual(ref.name, 'main');
 		assert.strictEqual(ref.refType, 'branch');
 	});
+
+	test('getSymbolicReferenceNameOrMissing reports only a ref git confirms is gone as missing', async () => {
+		const refs = repo.provider.refs;
+
+		assert.deepStrictEqual(await refs.getSymbolicReferenceNameOrMissing(repo.path, 'feature/refs-test'), {
+			name: 'feature/refs-test',
+			missing: false,
+		});
+		assert.deepStrictEqual(await refs.getSymbolicReferenceNameOrMissing(repo.path, 'feature/deleted'), {
+			name: undefined,
+			missing: true,
+		});
+		// A SHA exists but has no symbolic name
+		assert.deepStrictEqual(await refs.getSymbolicReferenceNameOrMissing(repo.path, getHeadSha(repo.path)), {
+			name: undefined,
+			missing: false,
+		});
+	});
 });
 
 suite('RefsSubProvider ref updates', () => {
@@ -308,8 +326,66 @@ suite('RefsSubProvider ref updates', () => {
 				expected: sha,
 			});
 
-			assert.ok(onChanged.calledWith(hookedRepo.path, ['heads']));
+			assert.ok(onChanged.calledWith(hookedRepo.path, ['config', 'heads']));
 			assert.ok(onReset.calledWith(hookedRepo.path, 'branches'));
+		} finally {
+			hookedRepo.cleanup();
+		}
+	});
+
+	test('a write names the ref it moved, and HEAD none', async () => {
+		const onChanged = sinon.spy();
+		const hookedRepo = createTestRepo({ hooks: { repository: { onChanged: onChanged } } });
+		try {
+			const sha = getHeadSha(hookedRepo.path);
+
+			for (const [ref, changes] of [
+				['refs/heads/named', ['heads']],
+				['refs/tags/named', ['tags']],
+				['refs/remotes/origin/named', ['remotes']],
+				['refs/stash', ['stash']],
+			] as const) {
+				onChanged.resetHistory();
+				await hookedRepo.provider.refs.updateReference(hookedRepo.path, ref, sha);
+				assert.deepStrictEqual(onChanged.args, [[hookedRepo.path, changes, [ref]]], ref);
+			}
+
+			onChanged.resetHistory();
+			await hookedRepo.provider.refs.updateReference(hookedRepo.path, 'HEAD', sha);
+			assert.deepStrictEqual(onChanged.args, [[hookedRepo.path, ['head', 'heads']]]);
+
+			execFileSync('git', ['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/named'], {
+				cwd: hookedRepo.path,
+				stdio: 'pipe',
+			});
+			onChanged.resetHistory();
+			await hookedRepo.provider.refs.updateReference(hookedRepo.path, 'refs/remotes/origin/HEAD', sha);
+			assert.deepStrictEqual(
+				onChanged.args,
+				[[hookedRepo.path, ['remotes']]],
+				'a symbolic ref moves the ref it points to, so it is not the one named',
+			);
+		} finally {
+			hookedRepo.cleanup();
+		}
+	});
+
+	test("a delete names the ref, and a branch's confines its config change to the branch's section", async () => {
+		const onChanged = sinon.spy();
+		const hookedRepo = createTestRepo({ hooks: { repository: { onChanged: onChanged } } });
+		try {
+			const sha = getHeadSha(hookedRepo.path);
+			await hookedRepo.provider.refs.updateReference(hookedRepo.path, 'refs/heads/doomed', sha);
+			await hookedRepo.provider.refs.updateReference(hookedRepo.path, 'refs/tags/doomed', sha);
+			onChanged.resetHistory();
+
+			await hookedRepo.provider.refs.deleteReference(hookedRepo.path, 'refs/heads/doomed');
+			await hookedRepo.provider.refs.deleteReference(hookedRepo.path, 'refs/tags/doomed');
+
+			assert.deepStrictEqual(onChanged.args, [
+				[hookedRepo.path, ['config', 'heads'], ['refs/heads/doomed'], { configConfinedToRefs: true }],
+				[hookedRepo.path, ['tags'], ['refs/tags/doomed']],
+			]);
 		} finally {
 			hookedRepo.cleanup();
 		}

@@ -90,10 +90,30 @@ export interface GitRunOptions {
 	readonly correlationKey?: string;
 	errors?: GitErrorHandling;
 	/**
+	 * Called before core retries a write that found `index.lock` held by another process — after the wait, right
+	 * before the next attempt. The index may have changed while the other process held the lock, so this lets the
+	 * caller re-check what the retry will act on (e.g. the staged set a `commit` records). Rejecting gives up: the
+	 * rejection reaches the caller as thrown — from `run` and from every typed write that takes run options — in every
+	 * `errors` mode. Reject with an `Error` (an object), as only an object can be told apart from git's own failure.
+	 * Throwing `lockError` back opts out of the retry, leaving the lock failure as the result.
+	 *
+	 * It runs while this checkout's index writes are held in order, so it must not write the index through core
+	 * (it would wait on itself). A run given this hook is never shared with an identical concurrent run. Only the
+	 * index-lock retry calls it, not the config-lock retry.
+	 */
+	beforeIndexLockRetry?: (lockError: Error) => void | Promise<void>;
+	/**
 	 * Non-zero exit codes that are answers rather than failures (e.g. `1` from `diff --quiet`, "has differences");
 	 * a listed code resolves as `exited` with that `exitCode` in every `errors` mode.
 	 */
 	expectedExitCodes?: readonly number[];
+	/**
+	 * Called once, when the git process starts: after any wait in core's queue, and not again for a lock retry. A call
+	 * that joins an identical run already in flight is told when that run starts, or at once if it already has. Not
+	 * called for a run that never starts (cancelled while queued), nor for one `caching` answers, even from a run
+	 * still in flight.
+	 */
+	onSpawn?: () => void;
 	/** Priority level for queue ordering. If not specified, will be inferred from the command type. */
 	priority?: GitCommandPriority;
 	/** Specifies that this command should always be executed locally if possible (for live share sessions) */
@@ -139,6 +159,9 @@ export interface GitRunOptions {
 	 * for every existing caller. The change is announced for `cwd`, or the `-C` target, as given: run from the
 	 * repository root, since that's the path core's caches are keyed by. A `-C`-scoped verb whose effect every
 	 * worktree shares (`branch`, `fetch`, …) is announced for the caller's `cwd` too, resetting once per repository.
+	 * `'infer'` names the refs the argv proves it moved, and for a verb that moves only HEAD's branch (a commit, a
+	 * reset) reads HEAD before and after the run: on one branch both times it names that branch, detached both times
+	 * it announces no branch move.
 	 *
 	 * The announcement resets only the caches the announced kinds can have made stale, the same ones a file
 	 * watcher's change of those kinds clears, and drops the repository's pending git runs. A write `'infer'`

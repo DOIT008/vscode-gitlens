@@ -1,6 +1,8 @@
+import type { Event } from '@gitlens/utils/event.js';
 import type { Uri } from '@gitlens/utils/uri.js';
-import type { CachedGitTypes } from '../cache.js';
+import type { CachedGitTypes, MergeTargetsChangeEvent } from '../cache.js';
 import type { RepositoryChange } from '../models/repository.js';
+import type { GitCommandPriority } from '../run.types.js';
 import type { GitIgnoreFilter } from '../watching/gitIgnoreFilter.js';
 import type { GitBlameSubProvider } from './blame.js';
 import type { GitBranchesSubProvider } from './branches.js';
@@ -24,6 +26,19 @@ import type { GitProviderDescriptor } from './types.js';
 import type { GitWorktreesSubProvider } from './worktrees.js';
 
 export type { GitProviderDescriptor } from './types.js';
+
+/** One path a provider announced its own write for, with the changes it announced there */
+export interface AnnouncedRepositoryChanges {
+	readonly repoPath: string;
+	readonly changes: readonly RepositoryChange[];
+	/** Full ref names the write moved, when it knows them — see `GitServiceHooks.repository.onChanged` */
+	readonly refs?: readonly string[];
+	/**
+	 * The write's `config` change touched only the `branch.<name>` sections of the local branches in {@link refs} —
+	 * see `GitServiceHooks.repository.onChanged`
+	 */
+	readonly configConfinedToRefs?: boolean;
+}
 
 /**
  * Common interface for all git providers (CLI, GitHub, etc.).
@@ -49,8 +64,81 @@ export interface GitProvider {
 	): Promise<string | undefined>;
 	excludeIgnoredUris?(repoPath: string, uris: Uri[]): Promise<Uri[]>;
 	getIgnoreFilter?(repoPath: string, gitDirPath: string): GitIgnoreFilter;
+	/**
+	 * The directories in the working tree that an ignore rule matches, as repo-relative `/`-separated paths — each
+	 * to be pruned from a file watcher along with its subtree. Nested entries are collapsed into their outermost
+	 * ancestor, and literal paths containing glob metacharacters are dropped (a watcher can't express them safely).
+	 */
+	getIgnoredDirectories?(repoPath: string, cancellation?: AbortSignal): Promise<string[]>;
+	/**
+	 * The working tree's ignored entries as repo-relative `/`-separated paths, the way `git status --ignored` lists
+	 * them: an ignored file is one entry, and a directory whose entire contents are ignored is one entry with a
+	 * trailing `/` (its contents aren't listed). Empty directories and `.git/` aren't listed. Sorted, and not capped —
+	 * the caller limits what it shows. Unlike `getIgnoredDirectories` this is a listing, not a watcher-pruning set, so
+	 * nothing is dropped or re-confirmed against the rules. `options.paths` limits the listing to those repo-relative
+	 * folders (or files), matched literally rather than as globs, so only they are walked — an empty array answers
+	 * empty without running git, and omitting it lists the whole working tree. A scope that is itself ignored, or lies
+	 * inside an ignored folder, is answered as one entry in the caller's scope (`dir/` for a folder, the path for a
+	 * file), never an ancestor outside it. `options.priority` (e.g.
+	 * `'interactive'`) is for a caller waiting on the answer.
+	 */
+	getIgnoredEntries?(
+		repoPath: string,
+		options?: { paths?: readonly string[]; priority?: GitCommandPriority },
+		cancellation?: AbortSignal,
+	): Promise<string[]>;
+	/**
+	 * An exact check of which of `paths` (repo-relative) git's ignore rules match — the subset that is ignored, as
+	 * given. A tracked file isn't reported as ignored, even when a rule matches it. This is git's answer, where the
+	 * in-memory `GitIgnoreFilter` errs toward not-ignored. Each path is checked as that exact file, never as pathspec
+	 * magic (a file named `:secret` is not `secret`), and comes back in the caller's spelling. A path git can't answer
+	 * (inside a submodule, beyond a symlink, outside the repository, or empty) isn't ignored, and doesn't cost the
+	 * others their answer; it rejects only when git fails for any other reason. Pass `options.priority` (e.g.
+	 * `'interactive'` when opening a file) for a caller waiting on the answer.
+	 */
+	getIgnoredPaths?(
+		repoPath: string,
+		paths: readonly string[],
+		options?: { priority?: GitCommandPriority },
+		cancellation?: AbortSignal,
+	): Promise<Set<string>>;
 	getIgnoredUrisFilter?(repoPath: string): Promise<(uri: Uri) => boolean>;
 	getLastFetchedTimestamp?(repoPath: string): Promise<number | undefined>;
+	/**
+	 * Fires when a write changed a branch's merge-relevant `.git/gk/config` keys — not for activity timestamps. The
+	 * provider's own key store fires it once, naming the branch, as the write completes; its section remove and
+	 * rename don't, nor do its internal saves while answering a read (only another process's watcher reports those).
+	 * See `Cache.onDidChangeMergeTargets`.
+	 */
+	readonly onDidChangeMergeTargets?: Event<MergeTargetsChangeEvent>;
+	/**
+	 * The repository's common path, as it appears in {@link onDidChangeMergeTargets} events; `undefined` when the
+	 * provider can't tell, because `repoPath` was never registered with it
+	 */
+	getCommonPath?(repoPath: string): string | undefined;
+	/**
+	 * The absolute, normalized folders under `repoPath`'s common git dir whose worktrees core acts as if didn't exist:
+	 * they are left out of worktree lists, and their add, remove, lock, unlock or move run through `notify: 'infer'`,
+	 * and the watcher's reports of their admin entries, raise no `worktrees` change (the typed worktree writes still
+	 * announce one). A host registers them, relative to the common git dir, for a tool's throwaway worktrees, which no
+	 * host shows (sync-tools' `sync-tools-worktrees`, for one). Each comes both as the common git dir is spelled and as
+	 * it resolves through symlinks, since git and such tools write resolved paths. `[]` when none is registered; rejects
+	 * when they can't be read, or not in time.
+	 */
+	getIgnoredWorktreeRoots?(repoPath: string): Promise<readonly string[]>;
+	/**
+	 * The folders of {@link getIgnoredWorktreeRoots}, relative to `repoPath`'s common git dir, as the host registered
+	 * them less any that isn't a literal path strictly inside it (see `sanitizeIgnoredWorktreeFolders`), read without
+	 * touching the disk: the watcher leaves them unwatched, unless one shares a directory the `.git` watch reads. `[]`
+	 * when none is registered.
+	 */
+	getIgnoredWorktreeFolders?(repoPath: string): readonly string[];
+	/**
+	 * Fires as the provider announces one of its own writes to the host (`hooks.repository.onChanged`), once for each
+	 * path it announces it for, sibling worktrees included — after the write finished and its caches were evicted.
+	 * `GitService` forwards it to its watch service, so the write's own file events aren't announced a second time.
+	 */
+	readonly onDidAnnounceChanges?: Event<AnnouncedRepositoryChanges>;
 	/** Creates a new repository at `path` (`git init`), creating `path` itself if it doesn't yet exist. */
 	init?(path: string, options?: { defaultBranch?: string; bare?: boolean }): Promise<void>;
 	/**

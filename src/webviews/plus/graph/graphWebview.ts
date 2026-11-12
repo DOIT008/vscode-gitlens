@@ -107,6 +107,7 @@ import { GlRepository } from '../../../git/models/repository.js';
 import { isSameRepoFamily } from '../../../git/models/repositoryShape.js';
 import {
 	getBranchAssociatedPullRequest,
+	getBranchMergeTarget,
 	getBranchMergeTargetInfo,
 	getBranchRemote,
 } from '../../../git/utils/-webview/branch.utils.js';
@@ -168,6 +169,7 @@ import type { EventVisibilityBuffer, SubscriptionTracker } from '../../rpc/event
 import { createRpcEvent } from '../../rpc/eventVisibilityBuffer.js';
 import { LaunchpadService } from '../../rpc/launchpadService.js';
 import { createSharedServices } from '../../rpc/services/common.js';
+import { NotificationsRpcService } from '../../rpc/services/notifications.js';
 import { proxyServices } from '../../rpc/services/proxy.js';
 import { WalkthroughService } from '../../rpc/walkthroughService.js';
 import type { WebviewHost, WebviewProvider, WebviewShowingArgs } from '../../webviewProvider.js';
@@ -952,6 +954,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			container: this.container,
 			host: this.host,
 			getSession: () => this._data.session,
+			getOpenEditorShowOptions: () => this.getOpenEditorShowOptions(),
 			getWipForRepoAndStats: async (repo, signal, options) => {
 				const result = await this._wip.getWipForRepoAndStats(repo, signal, options);
 				// This response goes straight to the client, bypassing the push channel — so the push dedup's
@@ -1325,6 +1328,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				onRequestShow: this._requestShowFeedbackEvent.subscribe(buffer, tracker),
 			},
 			launchpad: new LaunchpadService(this.container, buffer, tracker),
+			notifications: new NotificationsRpcService(this.container, this.host, buffer, tracker),
 			navigation: {
 				onRequestAction: this._requestActionEvent.subscribe(buffer, tracker),
 				onRequestOpenCompareMode: this._requestOpenCompareModeEvent.subscribe(buffer, tracker),
@@ -2241,6 +2245,13 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		}
 	}
 
+	onFocusChanged(focused: boolean): void {
+		// With the graph open twice, the editor's review follows the one the reader last worked in
+		if (focused) {
+			this._inspect.reclaimReview();
+		}
+	}
+
 	onVisibilityChanged(visible: boolean): void {
 		const repositoryChanged = this.repository != null && this.repository.etag !== this._etagRepository;
 		if (visible && (repositoryChanged || this.container.subscription.etag !== this._etagSubscription)) {
@@ -2866,11 +2877,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		// Lightweight WIP refresh — covers staging/unstaging (`index` → stats), `.gitignore` edits
 		// (`ignores` → which untracked files appear in `git status`), secondary-worktree add/remove
 		// (`worktrees` → wipRowsById; also falls through to the structural gate below as a
-		// backstop full-state push), tracking changes (`head|heads|remotes` → wip.branch.upstream,
-		// which drives the "Publish" ↔ "Create PR" next-step row in the details panel), and
-		// `.git/config` edits (`config` → wip.signing; the watcher currently always pairs `config`
-		// with `remotes`, but don't rely on that classifier detail). Unioned so the in-flight
-		// coalescer can't double-fire on a single multi-flag event (e.g. Pull's
+		// backstop full-state push), tracking changes (`head|heads|remotes|config` → wip.branch.upstream,
+		// which drives the "Publish" ↔ "Create PR" next-step row in the details panel; a `git branch -u`
+		// arrives as `config` alone, since the watcher delivers a write confined to `branch.<name>`
+		// sections without `remotes`), and other `.git/config` edits (`config` → wip.signing). Unioned so
+		// the in-flight coalescer can't double-fire on a single multi-flag event (e.g. Pull's
 		// `head, heads, remotes, index`).
 		if (e.changed('head', 'heads', 'index', 'ignores', 'remotes', 'worktrees', 'config')) {
 			void this._wip.notifyDidChangeWorkingTree();
@@ -2891,12 +2902,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			this._lastFetchedHandlerDebounced();
 		}
 
-		// Drop stale refsMetadata.issue cache entries on any `config` event. In practice `.git/config`
-		// writes are classified as `[config, remotes]` (the classifier can't cheaply tell a remote.*
-		// write from any other key change), so this is always paired with the `remotes` flag in the
-		// structural gate below, which runs `getState` → re-fetches fresh refsMetadata. There's no
-		// dedicated config-exclusive fast path because `e.changedExclusive('config')` would never
-		// match in the wild.
+		// Drop stale refsMetadata.issue cache entries on any `config` event. The watcher delivers a `.git/config`
+		// write confined to `branch.<name>` sections as `config` alone, and any other as `config` + `remotes`;
+		// either way `config` passes the structural gate below, which runs `getState` → re-fetches fresh
+		// refsMetadata.
 		if (e.changed('config')) {
 			this._producers.clearRefsMetadataIssues();
 		}
@@ -2907,6 +2916,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				'heads',
 				// 'index',
 				'remotes',
+				// A branch-only `.git/config` write (`git branch -u`, `git push -u` setting the upstream, …) comes
+				// as `config` without `remotes`, and rows embed each branch's upstream pill and HEAD's upstream
+				// (unpushed marks) — no lighter path refreshes those, so it takes the state rebuild
+				'config',
 				// 'remoteProviders',
 				'starred',
 				'stash',
@@ -2920,23 +2933,22 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			return;
 		}
 
-		// Branch tips, stored merge targets, and remote tracking can all move the merge-base anchor
-		// scope relies on. Drop the host-side overview cache and signal the webview to drop its
-		// mirrored merge-base cache so the next scope resolve recomputes against fresh refs.
-		// (config-only events are handled above; this branch covers heads/remotes mixed with anything.)
-		if (e.changed('heads', 'remotes')) {
+		// Branch tips, upstreams, and remote tracking can all move the merge-base anchor scope relies on.
+		// Drop the host-side overview cache and signal the webview to drop its mirrored merge-base cache so
+		// the next scope resolve recomputes against fresh refs.
+		if (e.changed('heads', 'remotes', 'config')) {
 			this.invalidateScopeAnchors();
-			// Local/remote tips moved → cached ahead/behind is stale. Re-fetch the tracked branches in place
-			// (delta), the one event that actually changes upstream counts — NOT every state push.
+			// Local/remote tips or upstreams moved → cached ahead/behind is stale. Re-fetch the tracked branches
+			// in place (delta), the events that actually change upstream counts — NOT every state push.
 			this._producers.invalidateUpstreamRefsMetadata();
 		}
 
-		// Invalidate sidebar panels only for changes that actually affect their data. Skipping this for
-		// config/unknown/pausedOp changes prevents the sidebar from showing a spinner during unrelated
-		// repo activity (e.g. worktrees discovered during graph scroll fire `unknown` repo events).
-		// Deferred to post-rebuild (see consumer in `notifyDidChangeState`) so the webview's refetch
-		// reads the updated graph session.
-		if (e.changed('heads', 'remotes', 'stash', 'tags', 'worktrees')) {
+		// Invalidate sidebar panels only for changes that actually affect their data (`config` for the
+		// branches panel's upstream/tracking). Skipping this for unknown/pausedOp changes prevents the
+		// sidebar from showing a spinner during unrelated repo activity (e.g. worktrees discovered during
+		// graph scroll fire `unknown` repo events). Deferred to post-rebuild (see consumer in
+		// `notifyDidChangeState`) so the webview's refetch reads the updated graph session.
+		if (e.changed('heads', 'remotes', 'config', 'stash', 'tags', 'worktrees')) {
 			this._sidebarEventCounter.next();
 		}
 
@@ -2945,7 +2957,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		// branchState; the webview dedups equal values (see the `branchState` guard in
 		// stateProvider.ts's `state.onStateChanged` handler), so the worst case is a redundant push
 		// discarded on receipt.
-		if (e.changed('head', 'heads', 'remotes')) {
+		if (e.changed('head', 'heads', 'remotes', 'config')) {
 			void this._producers.notifyDidChangeBranchStateOnly();
 		}
 
@@ -4246,38 +4258,37 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		if (branch == null) return undefined;
 
 		const cacheKey = branch.id;
-		const cached = this._scopeAnchorCache.get(cacheKey);
-		if (cached != null) return cached;
+		let anchor = this._scopeAnchorCache.get(cacheKey);
+		if (anchor == null) {
+			const promise = this.computeScopeAnchor(branch);
+			this._scopeAnchorCache.set(cacheKey, promise);
+			// Don't poison the cache with a rejection — refresh paths invalidate explicitly anyway, but
+			// a transient failure should be retryable on the next scope action.
+			promise.catch(() => {
+				if (this._scopeAnchorCache.get(cacheKey) === promise) {
+					this._scopeAnchorCache.delete(cacheKey);
+				}
+			});
+			anchor = promise;
+		}
 
-		const promise = this.computeScopeAnchor(branch);
-		this._scopeAnchorCache.set(cacheKey, promise);
-		// Don't poison the cache with a rejection — refresh paths invalidate explicitly anyway, but
-		// a transient failure should be retryable on the next scope action.
-		promise.catch(() => {
-			if (this._scopeAnchorCache.get(cacheKey) === promise) {
-				this._scopeAnchorCache.delete(cacheKey);
-			}
+		// A failed read anchors the focal branch alone, as a branch with no target does, rather than leaving the scope bare
+		return anchor.catch((ex: unknown) => {
+			Logger.error(ex, 'GraphWebviewProvider', 'resolveScopeAnchor');
+			return { focalBranchTipSha: branch.sha };
 		});
-		return promise;
 	}
 
 	private async computeScopeAnchor(branch: GitBranch): Promise<ResolvedScopeAnchor> {
 		const focalBranchTipSha = branch.sha;
 		const svc = this.container.git.getRepositoryService(branch.repoPath);
 
-		// Resolve target name — `getBranchMergeTargetInfo` already shares the underlying caches
-		// with `getBranchContributionsOverview` (`getStoredMergeTargetBranchName`/`getBaseBranchName`/
-		// `getDefaultBranchName`), so this doesn't add new git calls when the overview path also
-		// fires for the same branch.
-		const targetInfo = await getBranchMergeTargetInfo(this.container, branch, { timeout: 100 });
-		// Use the immediate value; ignore the paused PR-resolution continuation. Scope doesn't need
-		// to wait on PR API — base/default fall back covers the cold path while the eventual PR
-		// answer (if any) reaches the scope via overview enrichment, where `reconcileScopeMergeTarget`
-		// re-anchors live.
-		const targetName =
-			(targetInfo.mergeTargetBranch.paused ? undefined : targetInfo.mergeTargetBranch.value) ??
-			targetInfo.baseBranch ??
-			targetInfo.defaultBranch;
+		// The merge-target lookup shares its cached answer with `getBranchContributionsOverview`, so a warm one adds
+		// no git calls when the overview path also fires for the same branch. Use the immediate answer and
+		// ignore `pending`: scope doesn't wait on the PR API, and the late PR answer (if any) reaches the
+		// scope via overview enrichment, where `reconcileScopeMergeTarget` re-anchors live.
+		const { target } = await getBranchMergeTarget(this.container, branch, { timeout: 100, keepSelfAtTip: true });
+		const targetName = target?.ref;
 		if (targetName == null) return { focalBranchTipSha: focalBranchTipSha };
 
 		// Prefer the in-memory branch list for the target tip, just like the focal branch above.
@@ -4290,8 +4301,8 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		// older-history fold. Bailing there would leave the scope bare, and a bare scope dims everything off
 		// the focal first-parent line instead of scoping — for the default branch that line is the whole
 		// trunk, so almost nothing dims. Note `getBranchMergeTargetStatusInfo` (overviewEnrichment.utils.ts)
-		// still skips self-target status for the sidebars; that's safe because `reconcileScopeMergeTarget`
-		// only backfills anchors from enrichment, never strips them.
+		// still skips self-target status for the sidebars (its lookup omits `keepSelfAtTip`); that's safe
+		// because `reconcileScopeMergeTarget` only backfills anchors from enrichment, never strips them.
 		if (mergeTargetTipSha == null) return { focalBranchTipSha: focalBranchTipSha };
 
 		const mergeBaseSha = await svc.refs.getMergeBase(branch.ref, targetName);
@@ -4915,13 +4926,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				// `_includedRefTipShas` itself — leave it alone here.
 				if (cancellation.token.isCancellationRequested) return { refs: {}, continuation: continuation };
 
-				let targetBranchName: string | undefined;
-				if (result.mergeTargetBranch?.paused) {
-					continuation = result.mergeTargetBranch.value.then(async target => {
+				if (result.pending != null) {
+					continuation = result.pending.then(async target => {
 						if (target == null || cancellation?.token.isCancellationRequested) return undefined;
 
 						const refs = await this.getVisibleRefs(graph, current, {
-							baseOrTargetBranchName: target,
+							baseOrTargetBranchName: target.ref,
 							defaultBranchName: result.defaultBranch,
 						});
 						// The continuation replaces the ref set resolved above, so it must replace the
@@ -4934,12 +4944,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 						}
 						return Object.fromEntries(refs);
 					});
-				} else {
-					targetBranchName = result.mergeTargetBranch?.value;
 				}
 
 				refs = await this.getVisibleRefs(graph, current, {
-					baseOrTargetBranchName: targetBranchName ?? result.baseBranch,
+					baseOrTargetBranchName: result.target?.ref,
 					defaultBranchName: result.defaultBranch,
 				});
 
@@ -5795,7 +5803,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			// Worktree registry for the webview — the Agent Activity treemap maps agent file activity
 			// to repo-relative keys against these. Fetched directly (not via the graph session, which isn't
 			// loaded yet on the deferred-rows build).
-			this.repository.git.worktrees?.getWorktrees(toAbortSignal(cancellation.token)),
+			this.repository.git.worktrees?.getWorktrees(undefined, toAbortSignal(cancellation.token)),
 		]);
 		// Deferred worktree clean/dirty probe (see above) — surfaces changed worktrees in the WIP bar
 		// shortly after load without blocking or competing with the rows walk.
@@ -5983,13 +5991,19 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			// scope-anchor pipeline). Absent for detached / local-only / missing upstream.
 			const upstreamName = branch.upstream != null && !branch.upstream.missing ? branch.upstream.name : undefined;
 			if (upstreamName != null) {
+				// Matched by remote-ness too: a local `origin/x` and the remote `origin/x` share a name
+				const upstreamRemote = !branch.upstream!.local;
+				const mapped = this._data.session?.current.branches.get(upstreamName);
 				branchState.upstreamSha =
-					this._data.session?.current.branches.get(upstreamName)?.sha ??
+					(mapped?.remote === upstreamRemote ? mapped.sha : undefined) ??
 					(
 						await this.container.git
 							.getRepositoryService(branch.repoPath)
-							.branches.getBranch(upstreamName, undefined, toAbortSignal(cancellation.token))
-					)?.sha;
+							.branches.getBranches(
+								{ filter: b => b.name === upstreamName && b.remote === upstreamRemote },
+								toAbortSignal(cancellation.token),
+							)
+					).values[0]?.sha;
 			}
 		}
 
@@ -7024,6 +7038,10 @@ function convertBranchToIncludeOnlyRef(branch: GitBranch, remote?: boolean): Gra
 
 function convertBranchUpstreamToIncludeOnlyRef(branch: GitBranch): GraphIncludeOnlyRef | undefined {
 	if (branch.upstream == null || branch.upstream.missing) return undefined;
+	if (branch.upstream.local) {
+		const { name } = branch.upstream;
+		return { id: getBranchId(branch.repoPath, false, name), type: 'head', name: name };
+	}
 
 	const id = getBranchId(branch.repoPath, true, branch.upstream.name);
 	return {

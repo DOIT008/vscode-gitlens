@@ -1,28 +1,33 @@
-import type { CollectionMetadata } from '@gitkraken/provider-apis';
+import type { CollectionMetadata, CollectionScope } from '@gitkraken/provider-apis';
 import type { IssueShape, IssueSorting, IssueStateFilter } from '@gitlens/git/models/issue.js';
 import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
 import { mapBounded } from '@gitlens/utils/promise.js';
 import { assessCollectionMetadata, mergeAssessmentInto } from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
-import { providerFanOutConcurrency } from '../constants.js';
+import { IssuesCloudHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
 import { toError } from '../errors.js';
 import type { IntegrationResult } from '../models/integration.js';
-import type { ProjectIssuesDrain } from '../models/issueReads.js';
+import type { ProjectIssuesDrain, ProjectIssuesRecovery } from '../models/issueReads.js';
 import { isIssuesIntegration } from '../models/issuesIntegration.js';
+import type { LinearIntegration } from '../providers/linear.js';
 import { IssueFilter, providersMetadata } from '../providers/models.js';
 import { mergeCollectionMetadata, parsePageCursor } from '../providers/utils/providerPaging.js';
-import type { ProviderPagedResult, ProviderWarning } from '../results.js';
+import type { ProviderPagedResult, ProviderWarning, ProviderWarningSelector } from '../results.js';
 import { appendDedupedWarning, reconcileOmissionsWithFailure } from '../results.js';
-import { isIssuesHostIntegrationId } from '../utils/integration.utils.js';
+import { isIssuesHostIntegrationId, isLinearIntegration } from '../utils/integration.utils.js';
 import type { ProviderReadContext } from './context.js';
-import { parseIssueTrackerPageCursor, toIssueTrackerPageCursor } from './cursors.js';
-import { runCaptured } from './drains.js';
-import { projectKey, resourceIdForProject, resourceLabel, resourceMatchesOrg } from './hierarchy.utils.js';
+import { linearProjectIds, parseIssueTrackerPageCursor, toIssueTrackerPageCursor } from './cursors.js';
+import { discoverResources, runCaptured } from './drains.js';
+import { projectKey, resourceIdForProject, resourceLabel, selectorMatches } from './hierarchy.utils.js';
 import { resolveIssueSort, toIssueOrdering } from './ordering.js';
+import type { SelectionTarget, TrackerSelectorKind } from './selectionConfirmation.js';
+import { confirmCredential, confirmSelection, toSelectionAction } from './selectionConfirmation.js';
 import {
 	incompleteReadWarning,
 	issueTrackerOnlySurfaceWarning,
 	otherWarning,
+	projectCutWarning,
+	unmatchedSelectorWarning,
 	unmergeableIssueSortWarning,
 	unsupportedIssueSortWarning,
 	unsupportedWarning,
@@ -30,14 +35,17 @@ import {
 
 const issueStateFilters: readonly IssueStateFilter[] = ['open', 'closed', 'all'];
 
-export async function listIssueTrackerIssuesPage(
+export function listIssueTrackerIssuesPage(
 	ctx: ProviderReadContext,
 	options: {
 		providerId: IntegrationIds;
 		org?: string;
 		project?: string;
 		filters?: IssueFilter[];
-		/** Broadens the read to every assignee. Scopes to user-assigned issues when omitted. */
+		/**
+		 * Broadens the read to every assignee. Scopes to the user's issues when omitted: those assigned to them, and on
+		 * Linear also the GitHub-synced issues they created (unless `filters` asks for `Assignee` by name).
+		 */
 		includeAllAssignees?: boolean;
 		/**
 		 * How to order the issues, as `field:direction`. Omitted orders most-recently-updated-first where the
@@ -64,6 +72,16 @@ export async function listIssueTrackerIssuesPage(
 		 * another for `'closed'`/`'all'` refuses the read rather than serving its open issues.
 		 */
 		state?: IssueStateFilter;
+		/**
+		 * Linear only: narrows the read to issues in any of these Linear Projects (Linear's `Project` entity, by id).
+		 *
+		 * A narrowing of each team's read, not a scope of its own: the read is still windowed and selected by team
+		 * (`org`/`project`), and each team reports the issues in these Projects, server-side, so they don't count
+		 * against its page backstop. A Linear Project spans teams, so a read of every team is what reads a Project
+		 * whole. Refused by every other tracker rather than ignored, since ignoring it would publish the whole project.
+		 * Recorded in a composite cursor and checked on resume, as `state` is.
+		 */
+		linearProjects?: string[];
 		forceSync?: boolean;
 		page?: number;
 		cursor?: string;
@@ -76,6 +94,18 @@ export async function listIssueTrackerIssuesPage(
 		 */
 		domain?: string;
 	},
+): Promise<ProviderPagedResult<IssueShape>> {
+	return readIssueTrackerIssuesPage(ctx, options, false);
+}
+
+/**
+ * {@link listIssueTrackerIssuesPage}. `refreshed` marks the one read made again after a selection's confirmation
+ * found the cached discovery stale and dropped it, so this read's discovery is fresh and no further one is made.
+ */
+async function readIssueTrackerIssuesPage(
+	ctx: ProviderReadContext,
+	options: Parameters<typeof listIssueTrackerIssuesPage>[1],
+	refreshed: boolean,
 ): Promise<ProviderPagedResult<IssueShape>> {
 	// Pagination is opt-in: only window the projects when the caller actually asked to page. A caller that
 	// passes none of page/cursor/itemsPerPage keeps the "aggregate every matched project" contract, so an
@@ -91,6 +121,7 @@ export async function listIssueTrackerIssuesPage(
 		Math.trunc(compositeCursor?.currentPage ?? parsePageCursor(options.cursor) ?? options.page ?? 1),
 	);
 	const projectsPerPage = Math.max(1, Math.trunc(options.itemsPerPage ?? 20));
+	const linearProjects = linearProjectIds(options.linearProjects);
 
 	const items: IssueShape[] = [];
 	const warnings: ProviderWarning[] = [];
@@ -114,6 +145,7 @@ export async function listIssueTrackerIssuesPage(
 						retryProjects: retry.projects ?? [],
 						completedProjects: retry.completedProjects ?? [],
 						state: options.state,
+						linearProjects: linearProjects,
 					})
 				: undefined;
 		return {
@@ -231,24 +263,164 @@ export async function listIssueTrackerIssuesPage(
 		return emptyPage(true);
 	}
 
+	// Refused before any request like the state. A value that is not a list of non-empty ids is caller input, refused
+	// rather than dropped, since dropping it (or its last entry) widens the read to every issue; another tracker would
+	// ignore it and publish its whole project.
+	if (options.linearProjects != null) {
+		if (
+			!Array.isArray(options.linearProjects) ||
+			options.linearProjects.some(id => typeof id !== 'string' || id.length === 0)
+		) {
+			warnings.push(
+				otherWarning(
+					options.providerId,
+					domain,
+					options.connectionId,
+					'Linear Projects must be a list of non-empty ids.',
+				),
+			);
+			return emptyPage(true);
+		}
+		if (options.linearProjects.length > 0 && options.providerId !== IssuesCloudHostIntegrationId.Linear) {
+			warnings.push(
+				unsupportedWarning(
+					options.providerId,
+					domain,
+					options.connectionId,
+					`Narrowing by Linear Project is not supported by '${options.providerId}'.`,
+				),
+			);
+			return emptyPage(true);
+		}
+	}
+
+	// As with the state: a cursor resumed under other Projects skips teams drained under the ones it was minted for.
+	// Only a composite cursor records them, so any other cursor came from a read narrowed to none.
+	if (
+		options.cursor != null &&
+		(compositeCursor?.linearProjects ?? []).join('\0') !== (linearProjects ?? []).join('\0')
+	) {
+		warnings.push(
+			otherWarning(
+				options.providerId,
+				domain,
+				options.connectionId,
+				'The cursor belongs to a read of other Linear Projects; start again without it.',
+			),
+		);
+		return emptyPage(true);
+	}
+
 	await ctx.forceRefreshIfRequested(integration, options.forceSync, options.connectionId);
 
-	const { value: resources, warning: resourcesWarning } = await runCaptured(
-		options.providerId,
-		domain,
-		options.connectionId,
-		() => integration.getResourcesForUserResult(options.connectionId),
-	);
+	// A Project id the workspace no longer lists narrows every team to nothing, which would read as a Project with no
+	// issues. Reported as a selector miss instead, as an `org` or `project` that matches nothing is.
+	if (linearProjects != null && isLinearIntegration(integration)) {
+		const missing = await findUnlistedLinearProject(integration, linearProjects, options.connectionId);
+		if (missing != null) {
+			warnings.push(
+				unmatchedSelectorWarning(options.providerId, domain, options.connectionId, {
+					kind: 'linearProject',
+					value: missing,
+				}),
+			);
+		}
+	}
+
+	await integration.getCurrentAccount({ connectionId: options.connectionId }).catch(() => undefined);
+
+	const {
+		value: resources,
+		warning: resourcesWarning,
+		metadata: resourcesMetadata,
+	} = await discoverResources(integration, options.providerId, domain, options.connectionId);
 	if (resourcesWarning != null) {
 		warnings.push(resourcesWarning);
 	}
-	if (resources == null || resources.length === 0) {
-		const fetchFailed = resourcesWarning != null && resources == null;
-		return emptyPage(fetchFailed, false, fetchFailed ? discoveryFailureRetry() : undefined);
-	}
-
 	const scopedResources =
-		options.org != null ? resources.filter(r => resourceMatchesOrg(r, options.org!)) : resources;
+		options.org != null
+			? (resources ?? []).filter(r => selectorMatches(options.providerId, r, options.org!))
+			: (resources ?? []);
+	// Only a complete discovery proves a selection gone: a failed one may just not have reached it, and no resource
+	// list without a warning is no session.
+	const resourceDiscoveryComplete = resources != null && resourcesWarning == null;
+	const selectionTarget: SelectionTarget = {
+		integration: integration,
+		providerId: options.providerId,
+		domain: domain,
+		connectionId: options.connectionId,
+		org: options.org,
+		project: options.project,
+	};
+	const unconfirmed = (reasons: readonly ProviderWarning[]): ProviderPagedResult<IssueShape> => {
+		if (reasons.length === 0) {
+			warnings.push(
+				otherWarning(
+					options.providerId,
+					domain,
+					options.connectionId,
+					`Could not confirm '${options.project ?? options.org}' is gone, so it is not reported as removed.`,
+				),
+			);
+		}
+		for (const warning of reasons) {
+			appendDedupedWarning(warnings, warning);
+		}
+		return emptyPage(true, false, discoveryFailureRetry());
+	};
+	/**
+	 * Settles a selection the cached discovery matches nothing for from the provider's lists as they are now (see
+	 * {@link confirmSelection} and {@link toSelectionAction}). The cached lists can predate what was created since, so
+	 * a stale one is dropped and the read made once more over fresh lists; that read confirms the same way, since its
+	 * own discovery can still be joined to one started before the drop.
+	 */
+	const missSelection = async (
+		selector: ProviderWarningSelector & { kind: TrackerSelectorKind },
+	): Promise<ProviderPagedResult<IssueShape>> => {
+		const next = toSelectionAction(await confirmSelection(selectionTarget, selector.kind), refreshed);
+		switch (next.action) {
+			case 'unconfirmed':
+				return unconfirmed(next.warnings);
+			case 'refresh':
+				integration.invalidateDiscoveryCaches();
+				// The caches are dropped already: the refreshed read needs no second session sync.
+				return readIssueTrackerIssuesPage(ctx, { ...options, forceSync: false }, true);
+			case 'report-missing': {
+				const credential = await confirmCredential(selectionTarget, next.resource);
+				if (!credential.confirmed) {
+					return unconfirmed(credential.warning != null ? [credential.warning] : []);
+				}
+
+				// What the lists miss now: a selected org that is gone misses the org, whichever the cache missed.
+				const missed: ProviderWarningSelector =
+					next.missed === 'org' && options.org != null ? { kind: 'org', value: options.org } : selector;
+				warnings.push(
+					unmatchedSelectorWarning(options.providerId, domain, options.connectionId, missed, options.org),
+				);
+				return emptyPage();
+			}
+		}
+	};
+	// Checked before the empty return, since an account with no resources left misses the selection too.
+	if (options.org != null && resourceDiscoveryComplete && scopedResources.length === 0) {
+		return missSelection({ kind: 'org', value: options.org });
+	}
+	if (resources == null || resources.length === 0) {
+		if (options.project != null && resourceDiscoveryComplete) {
+			return missSelection({ kind: 'project', value: options.project });
+		}
+
+		const fetchFailed = resourcesWarning != null && resources == null;
+		const { truncated } = mergeAssessmentInto(
+			warnings,
+			options.providerId,
+			domain,
+			options.connectionId,
+			resourcesMetadata,
+		);
+		return emptyPage(fetchFailed, truncated, fetchFailed || truncated ? discoveryFailureRetry() : undefined);
+	}
+	// Only a partial discovery, reported by its warning, reaches here without the selected resource.
 	if (scopedResources.length === 0) {
 		return emptyPage();
 	}
@@ -277,6 +449,15 @@ export async function listIssueTrackerIssuesPage(
 	const projectDiscoveryFailed = projectDiscoveryAssessment.fetchFailed;
 	const projectDiscoveryTruncated = projectDiscoveryAssessment.truncated;
 	const projects = projectsResult?.values;
+	const matchedProjects =
+		options.project != null
+			? (projects ?? []).filter(p => selectorMatches(options.providerId, p, options.project!))
+			: (projects ?? []);
+	const projectDiscoveryComplete =
+		resourceDiscoveryComplete && projectsWarning == null && !projectDiscoveryFailed && !projectDiscoveryTruncated;
+	if (options.project != null && projects != null && projectDiscoveryComplete && matchedProjects.length === 0) {
+		return missSelection({ kind: 'project', value: options.project });
+	}
 	if (projects == null || projects.length === 0) {
 		const fetchFailed = (projectsWarning != null && projectsResult == null) || projectDiscoveryFailed;
 		return emptyPage(
@@ -285,9 +466,6 @@ export async function listIssueTrackerIssuesPage(
 			fetchFailed || projectDiscoveryTruncated ? discoveryFailureRetry() : undefined,
 		);
 	}
-
-	const matchedProjects =
-		options.project != null ? projects.filter(p => resourceMatchesOrg(p, options.project!)) : projects;
 
 	// Validate the requested filters against what this provider supports (e.g. Linear/Trello support only
 	// Assignee). An unsupported filter must not silently degrade — Linear/Trello ignore the requested type
@@ -324,7 +502,7 @@ export async function listIssueTrackerIssuesPage(
 		return emptyPage(true);
 	}
 
-	// Scope to the current user's assigned issues unless the caller broadens to all assignees. Resolve the
+	// Scope to the current user's issues unless the caller broadens to all assignees. Resolve the
 	// handle from each resource's own account (multi-account safe), capturing any error so its kind
 	// (e.g. auth) is preserved rather than collapsed to a generic warning.
 	let usersByResourceId: Map<string, string> | undefined;
@@ -533,6 +711,7 @@ export async function listIssueTrackerIssuesPage(
 					filters: options.filters,
 					sort: sort,
 					state: options.state,
+					...(linearProjects != null ? { linearProjects: linearProjects } : {}),
 				},
 			})),
 			options.connectionId,
@@ -549,11 +728,16 @@ export async function listIssueTrackerIssuesPage(
 			)),
 		})),
 	);
-
 	// Partial project discovery means some projects' issues are missing from this page; propagate it so the
 	// page reports fetchFailed even when every discovered project's own read succeeded.
 	let fetchFailed = projectDiscoveryFailed || accountLookupFailed;
-	let truncationRecovery: 'narrow-scope' | 'none' | undefined = projectDiscoveryTruncated ? 'none' : undefined;
+	// Whether a request failed, which `fetchFailed` alone doesn't say: see `assessCollectionMetadata`'s `requestFailed`.
+	let requestFailed = fetchFailed;
+	let truncated = projectDiscoveryTruncated;
+	// The projects whose read stopped short with nothing in its metadata to say why. One whose provider names its scope
+	// is reported on its own, even when the read also failed: a project's cut must not hide behind another's failure,
+	// which may be no more than an issue it skipped (#6011), nor its recovery behind another project's.
+	const cuts: { project: ResourceDescriptor; recovery: ProjectIssuesRecovery; scope: CollectionScope }[] = [];
 	let drainMetadata: CollectionMetadata | undefined;
 	for (const { project, value: result, warning } of perProject) {
 		const key = projectKey(project);
@@ -563,18 +747,22 @@ export async function listIssueTrackerIssuesPage(
 			// single failing token repeats verbatim once per project in the window.
 			appendDedupedWarning(warnings, warning);
 			fetchFailed = true;
-			truncationRecovery = 'none';
+			requestFailed = true;
+			truncated = true;
 		}
 		// A thrown/unsupported read (e.g. Linear not-implemented) surfaces as a warning with no value;
 		// mark the aggregate as fetchFailed so an empty result isn't mistaken for "no issues".
 		if (result == null) {
 			fetchFailed = true;
+			requestFailed = true;
 		}
 		if (result != null) {
 			items.push(...result.values);
 			if (result.truncated) {
-				const recovery = result.recovery;
-				truncationRecovery = truncationRecovery == null || truncationRecovery === recovery ? recovery : 'none';
+				truncated = true;
+				if (result.scope != null && !result.metadata?.failures?.length && !result.metadata?.omissions?.length) {
+					cuts.push({ project: project, recovery: result.recovery, scope: result.scope });
+				}
 			}
 			if (result.metadata != null) {
 				drainMetadata = mergeCollectionMetadata(drainMetadata, result.metadata);
@@ -596,38 +784,50 @@ export async function listIssueTrackerIssuesPage(
 	// publishes. A no-op when nothing merged, since the tracker already ordered that single run.
 	const orderedItems = ordering.order(items);
 
-	const projectReadReportedTruncation = truncationRecovery != null;
 	const drainAssessment = assessCollectionMetadata(options.providerId, domain, options.connectionId, drainMetadata);
 	for (const warning of drainAssessment.warnings) {
-		// A project result already supplies the recovery semantics. Replace metadata's unstructured fallback with
-		// the structured warning below, while retaining specific failures and omissions.
-		if (projectReadReportedTruncation && !drainAssessment.fetchFailed && warning.omission == null) continue;
+		// The truncation the projects reported already gets a structured warning below. Replace metadata's unstructured
+		// fallback, the only warning it raises when nothing failed and nothing was omitted, while retaining failures and
+		// omissions.
+		if (truncated && !drainAssessment.fetchFailed && warning.omission == null) continue;
 
 		appendDedupedWarning(warnings, warning);
 	}
 	fetchFailed = fetchFailed || drainAssessment.fetchFailed;
-	if (drainAssessment.truncated) {
-		truncationRecovery = 'none';
-	}
+	requestFailed = requestFailed || drainAssessment.requestFailed;
+	truncated = truncated || drainAssessment.truncated;
 
-	const projectTruncated = truncationRecovery != null;
-	const scopeTooLarge = !fetchFailed && truncationRecovery === 'narrow-scope';
-	if (scopeTooLarge || (!fetchFailed && projectTruncated && !warnings.some(warning => warning.omission != null))) {
+	for (const { project, recovery, scope } of cuts) {
+		appendDedupedWarning(
+			warnings,
+			projectCutWarning(
+				options.providerId,
+				domain,
+				options.connectionId,
+				resourceLabel(project),
+				recovery,
+				scope,
+			),
+		);
+	}
+	// A truncation no project's own warning accounts for (a project list read short, or a cut from a provider that names
+	// no scope for its projects) is reported for the read as a whole, unless a failure or an omission explains it. On
+	// `fetchFailed`, not `requestFailed`: an issue left unread truncates the read too, and its own warning explains that.
+	// A project list read short publishes its own warning, so it is never left to an unreadable issue's alone.
+	if (!fetchFailed && truncated && !warnings.some(warning => warning.omission != null)) {
 		appendDedupedWarning(
 			warnings,
 			incompleteReadWarning(
 				options.providerId,
 				domain,
 				options.connectionId,
-				scopeTooLarge
-					? 'Some projects hold more issues than one read can return; narrow the scope to read the rest.'
-					: 'Some issues were omitted; the provider returned an incomplete result.',
-				scopeTooLarge ? 'scope-too-large' : 'exhausted',
+				'Some issues were omitted; the provider returned an incomplete result.',
+				'exhausted',
 			),
 		);
 	}
 	// A metadata omission from an earlier project asserts the read succeeded; a later one may since have failed.
-	reconcileOmissionsWithFailure(warnings, fetchFailed);
+	reconcileOmissionsWithFailure(warnings, requestFailed);
 
 	const retryPages = retryWindowPages();
 	const cursor = toIssueTrackerPageCursor({
@@ -645,14 +845,45 @@ export async function listIssueTrackerIssuesPage(
 				? [...completedProjectKeys]
 				: [],
 		state: options.state,
+		linearProjects: linearProjects,
 	});
 	return {
 		items: orderedItems,
 		warnings: warnings,
-		page: { currentPage: page, itemsPerPage: orderedItems.length, truncated: projectTruncated || undefined },
+		page: { currentPage: page, itemsPerPage: orderedItems.length, truncated: truncated || undefined },
 		// Failed-project retries alone are manual. Only an untouched project window is automatic progress.
 		hasMore: nextPage != null && cursor != null,
 		cursor: cursor,
 		fetchFailed: fetchFailed || undefined,
+		requestFailed: requestFailed,
+		unexpectedGap: nextPage != null && cursor == null,
 	};
+}
+
+/**
+ * The first of `ids` the workspace's Projects don't list, confirmed against a list read past the cache, since a cached
+ * one can predate a Project created since. Undefined when every id is listed, or when no complete list can prove one
+ * missing: the read then goes ahead, and an id that names nothing reads as empty.
+ */
+async function findUnlistedLinearProject(
+	integration: LinearIntegration,
+	ids: readonly string[],
+	connectionId: string | undefined,
+): Promise<string | undefined> {
+	let unlisted: string | undefined;
+	for (const fresh of [false, true]) {
+		const projects = (await integration.getWorkspaceProjectsResult(connectionId, { fresh: fresh }))?.value;
+		if (
+			projects == null ||
+			projects.truncated === true ||
+			(projects.metadata != null && projects.metadata.completeness !== 'complete')
+		) {
+			return undefined;
+		}
+
+		const listed = new Set(projects.values.map(project => project.id));
+		unlisted = ids.find(id => !listed.has(id));
+		if (unlisted == null) return undefined;
+	}
+	return unlisted;
 }

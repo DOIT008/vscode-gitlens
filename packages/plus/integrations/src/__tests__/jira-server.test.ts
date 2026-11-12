@@ -12,6 +12,7 @@ import {
 import { createIntegrationService as createIntegrationManager } from '../integrationService.js';
 import type { IssuesIntegration } from '../models/issuesIntegration.js';
 import type { GitConfigEntityIdentifier } from '../providers/models.js';
+import { markRequestError } from '../providers/providerErrors.js';
 import type { ProvidersApi } from '../providers/providersApi.js';
 import {
 	encodeIssueOrPullRequestForGitConfig,
@@ -148,7 +149,7 @@ suite('Jira Server/Data Center (#5864)', () => {
 			},
 			getJiraServerProjects: (_t: unknown, baseUrl: string) => {
 				baseUrls.push(baseUrl);
-				return Promise.resolve([{ id: 'p1', name: 'PROJ' }]);
+				return Promise.resolve([{ id: 'p1', key: 'PROJ', name: 'Project' }]);
 			},
 			getJiraServerIssuesForProjectPaged: (_t: unknown, baseUrl: string) => {
 				baseUrls.push(baseUrl);
@@ -194,13 +195,13 @@ suite('Jira Server/Data Center (#5864)', () => {
 
 		assert.notEqual(first, second, 'each host gets its own integration instance');
 
-		// Same project id on both hosts, different names: a cache keyed only by token (both sessions could
+		// Same project id on both hosts, different keys: a cache keyed only by token (both sessions could
 		// legitimately carry one) would serve host A's projects for host B.
 		stubApi(first, {
-			getJiraServerProjects: () => Promise.resolve([{ id: 'p1', name: 'ALPHA' }]),
+			getJiraServerProjects: () => Promise.resolve([{ id: 'p1', key: 'ALPHA', name: 'Alpha' }]),
 		});
 		stubApi(second, {
-			getJiraServerProjects: () => Promise.resolve([{ id: 'p1', name: 'BETA' }]),
+			getJiraServerProjects: () => Promise.resolve([{ id: 'p1', key: 'BETA', name: 'Beta' }]),
 		});
 
 		const firstProjects = (
@@ -232,7 +233,7 @@ suite('Jira Server/Data Center (#5864)', () => {
 
 		const cursors: (string | undefined)[] = [];
 		stubApi(jiraServer, {
-			getJiraServerProjects: () => Promise.resolve([{ id: 'p1', name: 'PROJ' }]),
+			getJiraServerProjects: () => Promise.resolve([{ id: 'p1', key: 'PROJ', name: 'Project' }]),
 			getJiraServerIssuesForProjectPaged: (
 				_t: unknown,
 				baseUrl: string,
@@ -269,7 +270,7 @@ suite('Jira Server/Data Center (#5864)', () => {
 
 		const captured: { assigneeLogins?: string[] }[] = [];
 		stubApi(jiraServer, {
-			getJiraServerProjects: () => Promise.resolve([{ id: 'p1', name: 'PROJ' }]),
+			getJiraServerProjects: () => Promise.resolve([{ id: 'p1', key: 'PROJ', name: 'Project' }]),
 			getJiraServerIssuesForProjectPaged: (
 				_t: unknown,
 				_baseUrl: string,
@@ -357,7 +358,7 @@ suite('Jira Server/Data Center (#5864)', () => {
 			},
 			getJiraServerProjects: (_t: unknown, baseUrl: string) => {
 				baseUrls.push(baseUrl);
-				return Promise.resolve([{ id: 'p1', name: 'PROJ' }]);
+				return Promise.resolve([{ id: 'p1', key: 'PROJ', name: 'Project' }]);
 			},
 			getJiraServerIssue: (_t: unknown, baseUrl: string) => {
 				baseUrls.push(baseUrl);
@@ -425,8 +426,13 @@ suite('Jira Server/Data Center (#5864)', () => {
 		// An autolink or a stored reference can name an issue that was deleted or never existed. Jira answers
 		// 404; translating that into a `RequestNotFoundError` would log an exception where Jira Cloud's
 		// `getJiraIssueByKey` and the generic `getIssue` both report nothing found.
-		provider.getJiraServerIssueFn = () =>
-			Promise.reject(Object.assign(new Error('Issue does not exist'), { response: { status: 404 } }));
+		provider.getJiraServerIssueFn = () => {
+			const error = Object.assign(new Error('Issue does not exist'), {
+				response: { status: 404, body: { errorMessages: ['Issue does not exist'] } },
+			});
+			markRequestError(error, { url: 'https://jira.example.com/rest/api/2/issue/PROJ-404' });
+			return Promise.reject(error);
+		};
 
 		assert.equal(
 			await api.getJiraServerIssue(
@@ -485,7 +491,7 @@ suite('Jira Server/Data Center (#5864)', () => {
 		// with another project's key would read the wrong project's issues. The id cannot collide.
 		const addressedBy: string[] = [];
 		stubApi(jiraServer, {
-			getJiraServerProjects: () => Promise.resolve([{ id: '10001', name: 'ALPHA' }]),
+			getJiraServerProjects: () => Promise.resolve([{ id: '10001', key: 'ALPHA', name: 'Alpha' }]),
 			getJiraServerIssuesForProjectPaged: (_t: unknown, _baseUrl: string, projectKey: string) => {
 				addressedBy.push(projectKey);
 				return Promise.resolve({ data: [], hasMore: false, nextCursor: undefined });
@@ -495,7 +501,7 @@ suite('Jira Server/Data Center (#5864)', () => {
 		const projects = (
 			await jiraServer.getProjectsForResourcesWithMetadataResult((await jiraServer.getResourcesForUser())!)
 		)?.value?.values;
-		assert.equal(projects?.[0].name, 'ALPHA', 'the display name is still what the project is called');
+		assert.equal(projects?.[0].name, 'Alpha', 'the display name is still what the project is called');
 
 		await jiraServer.getIssuesForProject(projects[0]);
 
@@ -580,6 +586,100 @@ suite('Jira Server/Data Center (#5864)', () => {
 		assert.equal(result?.truncated, false);
 		assert.equal(result?.values.length, 1);
 		assert.equal(result?.metadata, undefined, 'a clean drain records no partial-completeness metadata');
+
+		manager.dispose();
+	});
+
+	test('an account-wide read keeps the siblings of an issue a page dropped, and reports the drop', async () => {
+		const manager = createIntegrationManager(createFakeRuntime());
+		const jiraServer = withSession(
+			(await manager.get(IssuesSelfManagedHostIntegrationId.JiraServer, 'jira.example.com'))!,
+			'jira.example.com',
+		);
+
+		// provider-apis drops an issue it can't read and reports it in the page's metadata (GKDEV-3652, #5992).
+		stubApi(jiraServer, {
+			getJiraServerIssuesForCurrentUser: (_t: unknown, baseUrl: string, options: { cursor?: string }) =>
+				Promise.resolve(
+					options.cursor == null
+						? {
+								data: [providerIssue('1', baseUrl)],
+								hasMore: true,
+								nextCursor: 'c1',
+								metadata: {
+									completeness: 'partial',
+									failures: [
+										{
+											scope: { providerId: 'jiraServer' },
+											kind: 'provider',
+											message: 'Skipped Jira issues that could not be read: PROJ-2 (boom).',
+											skippedItems: { keys: ['PROJ-2'], total: 1, complete: true },
+										},
+									],
+								},
+							}
+						: { data: [providerIssue('3', baseUrl)], hasMore: false, nextCursor: undefined },
+				),
+		});
+
+		const result = (await jiraServer.searchMyIssuesWithTruncationResult())?.value;
+		assert.equal(result?.values.length, 2, 'the drain reads past the page that dropped an issue');
+		assert.equal(result?.truncated, true, 'the account is missing the dropped issue');
+		assert.equal(result?.metadata?.completeness, 'partial');
+		// Under this read's own scope, as its other failures are: the SDK's provider id is not this integration's.
+		assert.deepEqual(
+			result?.metadata?.failures?.map(f => [f.scope, f.message, f.skippedItems]),
+			[
+				[
+					{ providerId: IssuesSelfManagedHostIntegrationId.JiraServer },
+					'Skipped Jira issues that could not be read: PROJ-2 (boom).',
+					{ keys: ['PROJ-2'], total: 1, complete: true },
+				],
+			],
+			'the raw metadata keeps what the SDK reported as skipped',
+		);
+
+		manager.dispose();
+	});
+
+	test('an account-wide read whose every page dropped issues reports them once', async () => {
+		const manager = createIntegrationManager(createFakeRuntime());
+		const jiraServer = withSession(
+			(await manager.get(IssuesSelfManagedHostIntegrationId.JiraServer, 'jira.example.com'))!,
+			'jira.example.com',
+		);
+
+		// GKDEV-3653: each unreadable page comes back empty and partial, naming its own keys.
+		stubApi(jiraServer, {
+			getJiraServerIssuesForCurrentUser: (_t: unknown, _baseUrl: string, options: { cursor?: string }) => {
+				const page = Number(options.cursor ?? 0);
+				return Promise.resolve({
+					data: [],
+					hasMore: page < 2,
+					nextCursor: page < 2 ? String(page + 1) : undefined,
+					metadata: {
+						completeness: 'partial',
+						failures: [
+							{
+								scope: { providerId: 'jiraServer' },
+								kind: 'provider',
+								message: `Skipped Jira issues that could not be read: PROJ-${page} (boom).`,
+								skippedItems: { keys: [`PROJ-${page}`], total: 1, complete: true },
+							},
+						],
+					},
+				});
+			},
+		});
+
+		const result = (await jiraServer.searchMyIssuesWithTruncationResult())?.value;
+		assert.equal(result?.truncated, true);
+		assert.deepEqual(
+			result?.metadata?.failures?.map(f => f.message),
+			[
+				'Skipped Jira issues that could not be read: PROJ-0 (boom). Issues on 2 more pages could not be read either.',
+			],
+		);
 
 		manager.dispose();
 	});

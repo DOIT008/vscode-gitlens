@@ -21,8 +21,10 @@ import type { IntegrationAuthenticationSessionDescriptor } from './integrationAu
 import type {
 	CloudIntegrationAuthType,
 	ConfiguredIntegrationDescriptor,
+	ConnectionResource,
 	ProviderAuthenticationSession,
 } from './models.js';
+import { getSessionIdentity } from './models.js';
 
 interface StoredSession {
 	id: string;
@@ -45,8 +47,15 @@ export interface ConfiguredIntegrationsChangeEvent {
 	readonly removed: readonly IntegrationIds[];
 }
 
+type IntegrationSessionChangeEvent = {
+	readonly integrationId: IntegrationIds;
+	readonly session: ProviderAuthenticationSession;
+	readonly previousDomain?: string;
+};
+
 export class ConfiguredIntegrationService implements Disposable {
 	private readonly _onDidChange = new Emitter<ConfiguredIntegrationsChangeEvent>();
+	private readonly _onWillChangeSession = new Emitter<IntegrationSessionChangeEvent>();
 	private storeConfiguredQueue: Promise<void> = Promise.resolve();
 	/**
 	 * One provider's secret and descriptor mutations run one at a time, so a sign-out never interleaves with a
@@ -61,11 +70,15 @@ export class ConfiguredIntegrationService implements Disposable {
 	get onDidChange(): Event<ConfiguredIntegrationsChangeEvent> {
 		return this._onDidChange.event;
 	}
+	get onWillChangeSession(): Event<IntegrationSessionChangeEvent> {
+		return this._onWillChangeSession.event;
+	}
 
 	constructor(private readonly ctx: IntegrationServiceContext) {}
 
 	dispose(): void {
 		this._onDidChange.dispose();
+		this._onWillChangeSession.dispose();
 	}
 
 	private _configured?: Map<IntegrationIds, ConfiguredIntegrationDescriptor[]>;
@@ -177,11 +190,15 @@ export class ConfiguredIntegrationService implements Disposable {
 		// the model re-stores the primary session with an empty account, after reconcile enriched it).
 		const type = descriptor.type ?? existing?.type;
 		const accountName = descriptor.accountName ?? existing?.accountName;
+		// A write without a workspace (a failed lookup, or a session re-store) keeps the stored pair whole.
+		const resource = descriptor.resourceId != null ? descriptor : existing;
 		const normalized: ConfiguredIntegrationDescriptor = {
 			...descriptor,
 			primary: primary,
 			type: type,
 			accountName: accountName,
+			resourceName: resource?.resourceName,
+			resourceId: resource?.resourceId,
 		};
 
 		let changed: boolean;
@@ -197,7 +214,9 @@ export class ConfiguredIntegrationService implements Disposable {
 				existing.scopes === normalized.scopes &&
 				(existing.primary ?? false) === (normalized.primary ?? false) &&
 				existing.type === normalized.type &&
-				existing.accountName === normalized.accountName
+				existing.accountName === normalized.accountName &&
+				existing.resourceName === normalized.resourceName &&
+				existing.resourceId === normalized.resourceId
 			) {
 				return;
 			}
@@ -209,7 +228,9 @@ export class ConfiguredIntegrationService implements Disposable {
 				existing.scopes !== normalized.scopes ||
 				(existing.primary ?? false) !== (normalized.primary ?? false) ||
 				existing.type !== normalized.type ||
-				existing.accountName !== normalized.accountName;
+				existing.accountName !== normalized.accountName ||
+				existing.resourceName !== normalized.resourceName ||
+				existing.resourceId !== normalized.resourceId;
 
 			// remove the existing descriptor from the array
 			descriptors.splice(descriptors.indexOf(existing), 1);
@@ -317,12 +338,22 @@ export class ConfiguredIntegrationService implements Disposable {
 	storeSession(
 		id: IntegrationIds,
 		session: ProviderAuthenticationSession,
-		options?: { signOutMark?: number },
+		options?: { signOutMark?: number; resource?: ConnectionResource },
 	): Promise<boolean> {
 		return this.withLock(id, async () => {
 			if (options?.signOutMark != null && this.isSignedOutSince(id, session, options.signOutMark)) return false;
 
-			await this.writeSecret(id, session);
+			const previous = await this.readSecret(id, session.id, session.cloud);
+			if (getSessionIdentity(previous) !== getSessionIdentity(session)) {
+				// Readers share this lock, so none can resolve the retired token after this synchronous fence.
+				this._onWillChangeSession.fire({
+					integrationId: id,
+					session: session,
+					previousDomain: previous?.domain,
+				});
+			}
+
+			await this.writeSecret(id, session, options?.resource);
 			return true;
 		});
 	}
@@ -486,6 +517,7 @@ export class ConfiguredIntegrationService implements Disposable {
 	private async writeSecret(
 		id: IntegrationIds,
 		session: ProviderAuthenticationSession | StoredSession,
+		resource?: ConnectionResource,
 	): Promise<void> {
 		await this.ctx.storage.storeSecret(
 			this.getSecretKey(id, session.id, session.cloud ?? false),
@@ -502,6 +534,8 @@ export class ConfiguredIntegrationService implements Disposable {
 			cloud: session.cloud ?? false,
 			type: session.type,
 			accountName: session.account?.label || undefined,
+			resourceName: resource?.name,
+			resourceId: resource?.id,
 		});
 	}
 

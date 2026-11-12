@@ -1,4 +1,5 @@
 import type { Account } from '@gitlens/git/models/author.js';
+import type { RefSet } from '@gitlens/git/models/autolink.js';
 import type { IssueSearchCriteria, IssueShape, IssueStateFilter } from '@gitlens/git/models/issue.js';
 import type {
 	PullRequest,
@@ -9,6 +10,7 @@ import type {
 import type { GitRemote } from '@gitlens/git/models/remote.js';
 import type { RemoteProviderId } from '@gitlens/git/models/remoteProvider.js';
 import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
+import { CancellationError, raceWithTimeout } from '@gitlens/utils/cancellation.js';
 import { gate } from '@gitlens/utils/decorators/gate.js';
 import { debug, trace } from '@gitlens/utils/decorators/log.js';
 import type { Disposable } from '@gitlens/utils/disposable.js';
@@ -25,7 +27,9 @@ import { IntegrationAuthenticationService } from './authentication/integrationAu
 import type {
 	CloudIntegrationConnection,
 	ConfiguredIntegrationDescriptor,
+	ConnectionResource,
 	ProviderAuthenticationSession,
+	SessionPublication,
 } from './authentication/models.js';
 import {
 	getSupportedCloudIntegrationIds,
@@ -52,6 +56,8 @@ import type {
 import { toError } from './errors.js';
 import type {
 	ClosedPullRequestSweepOptions,
+	GetAutolinkReferencesOptions,
+	ListLinearProjectsOptions,
 	ListOrgsOptions,
 	ListProjectsOptions,
 	ProviderBroadenOrg,
@@ -81,6 +87,7 @@ import type {
 } from './providers/models.js';
 import { providersMetadata } from './providers/models.js';
 import type { ProvidersApi } from './providers/providersApi.js';
+import { getAutolinkReferences } from './reads/autolinks.js';
 import { broadenIssues } from './reads/broaden.js';
 import type { RepositoryResolutionContext } from './reads/context.js';
 import type {
@@ -94,7 +101,7 @@ import type { CurrentAccountResult } from './reads/currentAccount.js';
 import { getCurrentAccount } from './reads/currentAccount.js';
 import type { SupportedFilters } from './reads/filters.js';
 import { getSupportedFilters } from './reads/filters.js';
-import { listOrgs, listProjects, listRepos } from './reads/hierarchy.js';
+import { listLinearProjects, listOrgs, listProjects, listRepos } from './reads/hierarchy.js';
 import type { IssueBatchResult, IssueBatchTarget } from './reads/issueBatch.js';
 import { getIssuesBatch } from './reads/issueBatch.js';
 import { listIssuesPage } from './reads/issues.js';
@@ -112,6 +119,7 @@ import { noConnectionWarning } from './reads/warnings.js';
 import type {
 	ConnectionStateChangeEvent,
 	ProviderBroadenResult,
+	ProviderLinearProjectShape,
 	ProviderPagedResult,
 	ProviderResult,
 	ProviderSweepResult,
@@ -138,6 +146,7 @@ export interface IntegrationConnectionChangeEvent extends ConnectionStateChangeE
 }
 
 const maxSmallIntegerV8 = 2 ** 30 - 1; // Max number that can be stored in V8's smis (small integers)
+const resourceLookupTimeoutMs = 10 * 1000;
 
 export class IntegrationService implements Disposable, RepositoryResolutionContext {
 	get onDidChange(): Event<ConfiguredIntegrationsChangeEvent> {
@@ -155,6 +164,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	private readonly _onDidChangeIntegrationConnection = new Emitter<IntegrationConnectionChangeEvent>();
 	private readonly _apiDisposables: Disposable[] = [];
 	private _apis: ApiClients | undefined;
+	private _disposed = false;
 
 	/** The package-built, memoized per-provider API clients (was injected via the now-removed `ctx.apis`). */
 	get apis(): ApiClients {
@@ -172,6 +182,9 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		private readonly ctx: IntegrationServiceContext,
 	) {
 		this._disposable = fromDisposables(
+			configuredIntegrationService.onWillChangeSession(({ integrationId, session, previousDomain }) => {
+				this.onSessionPublishing(integrationId, { session: session }, [session.domain, previousDomain]);
+			}),
 			ctx.config.onDidChange(e => {
 				if (e.remotes) {
 					this._ignoreSSLErrors.clear();
@@ -185,6 +198,9 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	}
 
 	dispose(): void {
+		if (this._disposed) return;
+
+		this._disposed = true;
 		this._integrations.forEach(i => i.dispose());
 		this._integrations.clear();
 		this._disposable?.dispose();
@@ -1062,18 +1078,19 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	 * provider (the integration's primary-only sync path would never reach a secondary account), while a
 	 * primary read syncs via the integration's own cloud-connection machinery. Either way the integration's cached
 	 * discovery (a tracker's project list) is dropped, so the read sees projects created or deleted since.
-	 * Best-effort — a failed sync is swallowed so the read still proceeds (and surfaces its own warning).
+	 * Best-effort by default; strict discovery can require refresh success before trusting the resolved identity.
 	 */
 	async forceRefreshIfRequested(
 		integration: Integration,
 		forceSync: boolean | undefined,
 		connectionId: string | undefined,
+		options?: { throwOnFailure?: boolean },
 	): Promise<void> {
 		if (forceSync !== true) return;
 
 		// Up front and unconditionally: the per-connection branch below re-syncs through the auth provider, which
 		// never reaches the integration's own re-sync that drops them, and a failed sync still has the read go ahead.
-		integration.invalidateDiscoveryCaches();
+		integration.invalidateDiscoveryForConnection(connectionId);
 
 		try {
 			if (connectionId != null) {
@@ -1085,12 +1102,17 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 				const descriptor = { ...integration.authProviderDescriptor, connectionId: connectionId, cloud: true };
 				const session = await authProvider?.getSession(descriptor, { sync: true, refetch: true });
 				if (session == null) {
+					if (options?.throwOnFailure) throw new Error('No refreshed provider session');
+
 					await authProvider?.deleteSession(descriptor);
 				}
 			} else {
-				await integration.syncCloudConnection('connected', true);
+				const failure = await integration.syncCloudConnection('connected', true);
+				if (failure != null) throw failure;
 			}
-		} catch {}
+		} catch (ex) {
+			if (options?.throwOnFailure) throw ex;
+		}
 	}
 
 	/**
@@ -1111,6 +1133,19 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	 */
 	async listProjects(options?: ListProjectsOptions): Promise<ProviderResult<ProviderOrganization>> {
 		return listProjects(this, options);
+	}
+
+	async getAutolinkReferences(options: GetAutolinkReferencesOptions): Promise<RefSet | undefined> {
+		return getAutolinkReferences(this, options);
+	}
+
+	/**
+	 * Lists the Linear workspace's Projects (Linear's `Project` entity), apart from the teams {@link listProjects}
+	 * returns for Linear. Narrow a Linear issue read to some of them with `listIssueTrackerIssuesPage`'s
+	 * `linearProjects`.
+	 */
+	async listLinearProjects(options?: ListLinearProjectsOptions): Promise<ProviderResult<ProviderLinearProjectShape>> {
+		return listLinearProjects(this, options);
 	}
 
 	/**
@@ -1174,6 +1209,10 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		domain?: string;
 		/** See {@link IntegrationManager.listPullRequestsPage}. */
 		summary?: boolean;
+		/** See {@link IntegrationManager.listPullRequestsPage}. */
+		scopeConcurrency?: number;
+		/** See {@link IntegrationManager.listPullRequestsPage}. */
+		includeRemoteInfo?: boolean;
 	}): Promise<ProviderPagedResult<PullRequestShape>> {
 		return listPullRequestsPage(this, options);
 	}
@@ -1197,6 +1236,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	}
 
 	async listIssuesPage(options: {
+		state?: IssueStateFilter;
 		providerId: IntegrationIds;
 		repos?: ProviderReposInput;
 		/** Narrows the account-wide read to one org/account. Requires a host with a project layer (Azure). */
@@ -1224,6 +1264,8 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		cursor?: string;
 		itemsPerPage?: number;
 		forceSync?: boolean;
+		/** See {@link IntegrationManager.listIssuesPage}. */
+		scopeConcurrency?: number;
 		connectionId?: string;
 		/**
 		 * Explicit self-managed host domain. Used only when the requested connection has no configured domain;
@@ -1377,6 +1419,8 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		 * `getSupportedFilters().issueStates` and are refused otherwise.
 		 */
 		state?: IssueStateFilter;
+		/** Linear only: narrows the read to issues in any of these Linear Projects, by id. */
+		linearProjects?: string[];
 		forceSync?: boolean;
 		page?: number;
 		cursor?: string;
@@ -1608,13 +1652,30 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 
 	private _providersApi: Promise<ProvidersApi> | undefined;
 	private async getProvidersApi() {
+		if (this._disposed) throw new CancellationError();
+
 		if (this._providersApi == null) {
 			const authenticationService = this.authenticationService;
-			async function load() {
-				return new (
-					await import(/* webpackChunkName: "integrations" */ './providers/providersApi.js')
-				).ProvidersApi(authenticationService);
-			}
+			const apis = authenticationService.apis;
+			const load = async () => {
+				const { ProvidersApi } = await import(
+					/* webpackChunkName: "integrations" */ './providers/providersApi.js'
+				);
+				if (this._disposed) throw new CancellationError();
+
+				const api = new ProvidersApi(
+					authenticationService,
+					apis.azureWorkItemStates,
+					apis.azureWorkItemDescriptions,
+				);
+				if (this._disposed) {
+					api.dispose();
+					throw new CancellationError();
+				}
+
+				this._apiDisposables.push(api);
+				return api;
+			};
 
 			// Never keep a rejected promise cached: a single failure (a module-resolution error, a transient
 			// construction failure) would otherwise poison every `ProvidersApi` read for the lifetime of the
@@ -1707,6 +1768,24 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 
 	private getCachedForDomain<T extends IntegrationIds>(id: T, domain?: string): IntegrationById<T> | undefined {
 		return isSelfManagedHostIntegrationId(id) ? this.getCached(id, domain) : this.findCachedById(id);
+	}
+
+	onSessionPublishing(
+		id: IntegrationIds,
+		publication: SessionPublication,
+		domains: readonly (string | undefined)[],
+	): void {
+		const notified = new Set<Integration>();
+		for (const domain of domains) {
+			const integration = this.getCachedForDomain(
+				id,
+				domain == null ? domain : (hostFromDomain(domain) ?? domain),
+			);
+			if (integration == null || notified.has(integration)) continue;
+
+			notified.add(integration);
+			integration.onSessionPublishing(publication);
+		}
 	}
 
 	private getConfiguredCloudConnection(id: IntegrationIds, connectionId: string): ConfiguredIntegrationDescriptor {
@@ -1907,8 +1986,8 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 				// On a routine (non-forced) check-in, skip the token fetch + secret write for a connection we
 				// already have stored and that hasn't expired: nothing to refresh, so avoid the extra GK API
 				// traffic and secret churn. Still treat it as synced (so it doesn't trip the prune guard) and
-				// record its primary below. Forced syncs, new connections, and expired tokens fall through and
-				// fetch as before.
+				// record its primary below. Forced syncs, new connections, expired tokens and connections stored
+				// without their workspace fall through and fetch as before.
 				// A re-pointed connection is NOT unchanged, even though the token is still good: `host` is
 				// normalized, so a backend connection moved to a different context path on the same host looks
 				// identical by domain and would keep every read on the stale path until expiry. Compare the
@@ -1920,7 +1999,16 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 					isSelfManagedHostIntegrationId(id) &&
 					Boolean(connection.domain?.trim()) &&
 					!sameConfiguredBaseUrl(cached?.baseUrl, connection.domain);
-				if (!forceConnect && cached != null && !isDescriptorExpired(cached) && !baseUrlChanged) {
+				// Nor is one stored without its workspace: a token fetched outside this reconcile (the primary sync
+				// above on a cold integration, or a read) is stored without one, and would otherwise stay so.
+				const resourceMissing = carriesConnectionResource(id) && cached?.resourceId == null;
+				if (
+					!forceConnect &&
+					cached != null &&
+					!isDescriptorExpired(cached) &&
+					!baseUrlChanged &&
+					!resourceMissing
+				) {
 					return { kind: 'cached' as const, connection: connection, host: host };
 				}
 
@@ -1950,11 +2038,14 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						};
 					}
 
+					const resource = await this.resolveResource(id, host, providerSession);
+
 					return {
 						kind: 'fetched' as const,
 						connection: connection,
 						host: host,
 						providerSession: providerSession,
+						resource: resource,
 					};
 				} catch (ex) {
 					scope?.warn(
@@ -1974,6 +2065,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 				prepared.kind === 'fetched' &&
 				!(await this.configuredIntegrationService.storeSession(id, prepared.providerSession, {
 					signOutMark: signOutMark,
+					resource: prepared.resource,
 				}))
 			) {
 				// Signed out while it was fetched: neither synced (so nothing is pruned on its account) nor primary.
@@ -2074,6 +2166,32 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	}
 
 	/**
+	 * Resolves the workspace a connection's token was granted for, asking the provider with that token every time the
+	 * reconcile fetches it, which includes every sync while the connection has no workspace stored. Best-effort:
+	 * undefined on any failure, in which case the stored pair is kept and the next fetch looks it up again.
+	 */
+	private async resolveResource(
+		id: IntegrationIds,
+		host: string | undefined,
+		session: ProviderAuthenticationSession,
+	): Promise<ConnectionResource | undefined> {
+		// Skipping the rest keeps their token fetches free of an integration lookup.
+		if (!carriesConnectionResource(id)) return undefined;
+
+		const scope = getScopedLogger();
+		try {
+			const integration = await this.get(id, host);
+			if (integration == null) return undefined;
+
+			// Bounded: the sync awaits every connection, so a hung lookup must not stall the whole refresh.
+			return await raceWithTimeout(integration.getProviderResourceForSession(session), resourceLookupTimeoutMs);
+		} catch (ex) {
+			scope?.warn(`Failed to resolve workspace for '${id}': ${ex instanceof Error ? ex.message : String(ex)}`);
+			return undefined;
+		}
+	}
+
+	/**
 	 * Resolves a human-readable account handle (e.g. the GitHub login) for a connection by asking the
 	 * provider API with that connection's token. The token backend doesn't expose it. Routes through the
 	 * integration model so the correct provider API base URL (incl. self-managed domains) and auth type
@@ -2153,6 +2271,11 @@ function protocolFromDomain(domain: string | undefined): string | undefined {
 function normalizeAccountName(accountName: string | undefined): string | undefined {
 	const value = accountName?.trim();
 	return value ? value : undefined;
+}
+
+/** Whether the provider's connections carry a workspace (Linear only). */
+function carriesConnectionResource(id: IntegrationIds): boolean {
+	return id === IssuesCloudHostIntegrationId.Linear;
 }
 
 /**

@@ -8,6 +8,8 @@ export type GitCoreConfigKeys =
 	| 'core.excludesFile'
 	/** `core.hooksPath` — the directory git runs hooks from instead of `$GIT_DIR/hooks` */
 	| 'core.hooksPath'
+	/** `core.ignorecase` — whether git matches paths (including ignore patterns) case-insensitively */
+	| 'core.ignorecase'
 	| 'diff.guitool'
 	| 'diff.tool'
 	/** `fetch.prune` — whether `git fetch` removes remote-tracking branches that no longer exist on the remote */
@@ -147,13 +149,17 @@ export interface GitConfigSubProvider {
 		| []
 	>;
 
-	getGkConfig?(repoPath: string, key: GkConfigKeys | DeprecatedGkConfigKeys): Promise<string | undefined>;
+	getGkConfig?(
+		repoPath: string,
+		key: GkConfigKeys | DeprecatedGkConfigKeys,
+		options?: { throwOnError?: boolean },
+	): Promise<string | undefined>;
 	getGkConfigRegex?(repoPath: string, pattern: string): Promise<Map<string, string>>;
 	setGkConfig?(
 		repoPath: string,
 		key: GkConfigKeys | DeprecatedGkConfigKeys,
 		value: string | undefined,
-		options?: { skipInvalidation?: readonly GkConfigInvalidationTarget[] },
+		options?: { skipInvalidation?: readonly GkConfigInvalidationTarget[]; throwOnError?: boolean },
 	): Promise<void>;
 	/**
 	 * Drops every gk key stored for `ref` — call when a branch stops existing under that name. Deliberately

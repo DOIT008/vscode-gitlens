@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { GitPullRequestReviewState } from '@gitkraken/provider-apis';
 import { suite, test } from 'mocha';
 import type { PullRequestShape } from '@gitlens/git/models/pullRequest.js';
 import {
@@ -32,6 +33,7 @@ import {
 	primarySession,
 	providerPr,
 	stubApi,
+	stubAzureOrganizationUser,
 	watchRequestFailures,
 } from './sweepHelpers.js';
 
@@ -276,6 +278,7 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 			'other',
 			'caller input the caller fixes is not an unsupported capability',
 		);
+		assert.equal(result.warnings[0].targetKeys, undefined, 'a whole-call refusal names no targets');
 
 		manager.dispose();
 	});
@@ -293,6 +296,28 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 		assert.equal(result.warnings[0].kind, 'unsupported');
 		assert.equal(result.warnings[0].isAuth, false);
 		assert.match(result.warnings[0].message, /not supported/i);
+		assert.equal(result.warnings[0].targetKeys, undefined, 'a wrong-surface refusal names no targets');
+
+		manager.dispose();
+	});
+
+	test('a host that answers a full read with neither slots nor an error drops every target, naming each', async () => {
+		const { manager, gh } = await connectedGitHub(createFakeRuntime());
+		stubBatchResult(gh, () => Promise.resolve({ value: undefined }));
+
+		const result = await manager.getPullRequestsBatch({
+			providerId: GitCloudHostIntegrationId.GitHub,
+			targets: [
+				{ key: 'a', owner: 'o', repo: 'r', number: 1 },
+				{ key: 'b', owner: 'o', repo: 'r', number: 2 },
+			],
+		});
+
+		assert.deepEqual(result.items, []);
+		assert.equal(result.fetchFailed, true);
+		assert.equal(result.warnings.length, 1);
+		assert.equal(result.warnings[0].kind, 'unsupported');
+		assert.deepEqual(result.warnings[0].targetKeys, ['a', 'b']);
 
 		manager.dispose();
 	});
@@ -428,6 +453,7 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 		assert.deepEqual(result.items, [], 'no target is reported as proven absent');
 		assert.equal(result.fetchFailed, true);
 		assert.equal(result.warnings[0]?.kind, 'no-connection', 'reported as a connection problem, not "unsupported"');
+		assert.deepEqual(result.warnings[0]?.targetKeys, ['a'], 'the failed integration call names every target');
 
 		manager.dispose();
 	});
@@ -580,6 +606,7 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 		);
 		assert.equal(result.fetchFailed, true);
 		assert.equal(result.warnings.length, 1);
+		assert.deepEqual(result.warnings[0].targetKeys, ['k26'], "only the failed chunk's target is named");
 
 		manager.dispose();
 	});
@@ -615,6 +642,7 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 		assert.equal(result.fetchFailed, true);
 		assert.equal(result.warnings[0]?.kind, 'other', 'a target failing on its own is not an auth warning');
 		assert.match(result.warnings[0]?.message ?? '', /SAML enforcement/);
+		assert.deepEqual(result.warnings[0]?.targetKeys, ['saml']);
 		assert.equal(getRequestExceptionCount(gh), 0, 'a working token must not spend a strike');
 		assert.deepEqual(
 			(gh as unknown as { _session: ProviderAuthenticationSession })._session,
@@ -696,6 +724,11 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 			assert.deepEqual(
 				result.warnings.filter(w => w.kind === 'auth').map(w => w.scope),
 				[{ repositoryId: 'o/r' }, { repositoryId: 'o/s' }],
+			);
+			assert.deepEqual(
+				result.warnings.filter(w => w.kind === 'auth').map(w => w.targetKeys),
+				[['a'], ['b']],
+				'each scoped refusal names its own target',
 			);
 			assert.equal(checks.probes, 1);
 			assert.equal(getRequestExceptionCount(gh), 0, 'a confirmed credential spends no strike');
@@ -1027,6 +1060,7 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 			});
 			const { manager, azure } = await connectedAzure(runtime);
 			stubCurrentAccount(azure, 'me');
+			await stubAzureOrganizationUser(azure, 'me');
 
 			const result = await manager.getPullRequestsBatch({
 				providerId: GitCloudHostIntegrationId.AzureDevOps,
@@ -1048,6 +1082,7 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 			azureHtmlStatus(runtime, 404);
 			const { manager, azure } = await connectedAzure(runtime);
 			stubCurrentAccount(azure, 'me');
+			await stubAzureOrganizationUser(azure, 'me');
 
 			const result = await manager.getPullRequestsBatch({
 				providerId: GitCloudHostIntegrationId.AzureDevOps,
@@ -1065,6 +1100,7 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 			azureStatus(runtime, 404, { typeKey: 'SomeOtherException', message: 'nope' });
 			const { manager, azure } = await connectedAzure(runtime);
 			stubCurrentAccount(azure, 'me');
+			await stubAzureOrganizationUser(azure, 'me');
 
 			const result = await manager.getPullRequestsBatch({
 				providerId: GitCloudHostIntegrationId.AzureDevOps,
@@ -1085,6 +1121,7 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 				azureStatus(runtime, status);
 				const { manager, azure } = await connectedAzure(runtime);
 				stubCurrentAccount(azure, 'me');
+				await stubAzureOrganizationUser(azure, 'me');
 
 				const result = await manager.getPullRequestsBatch({
 					providerId: GitCloudHostIntegrationId.AzureDevOps,
@@ -1106,6 +1143,7 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 			});
 			const { manager, azure } = await connectedAzure(runtime);
 			stubCurrentAccount(azure, 'me');
+			await stubAzureOrganizationUser(azure, 'me');
 
 			const result = await manager.getPullRequestsBatch({
 				providerId: GitCloudHostIntegrationId.AzureDevOps,
@@ -1122,6 +1160,7 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 		test('a hit asks for clone URLs and is converted like the repo-scoped list rows', async () => {
 			const { manager, azure } = await connectedAzure(createFakeRuntime());
 			stubCurrentAccount(azure, 'me');
+			await stubAzureOrganizationUser(azure, 'me');
 			const inputs: Parameters<GetPullRequestForRepoFn>[0][] = [];
 			await stubSdkPullRequestFn(manager, GitCloudHostIntegrationId.AzureDevOps, input => {
 				inputs.push(input);
@@ -1143,6 +1182,56 @@ suite('IntegrationManager.getPullRequestsBatch', () => {
 			]);
 			assert.equal(result.items[0]?.pullRequest?.number, 7);
 			assert.equal(result.items[0]?.pullRequest?.authoredByMe, true);
+
+			manager.dispose();
+		});
+
+		test("matches authorship against the organization's identity, not the profile id (#6032)", async () => {
+			const { manager, azure } = await connectedAzure(createFakeRuntime());
+			stubCurrentAccount(azure, 'profile-id');
+			await stubAzureOrganizationUser(azure, 'me');
+			await stubSdkPullRequestFn(manager, GitCloudHostIntegrationId.AzureDevOps, () =>
+				Promise.resolve({
+					data: providerPr('7', {
+						number: 7,
+						author: { id: 'me', name: 'Me', email: null, username: 'me', avatarUrl: null, url: null },
+					}),
+				}),
+			);
+
+			const result = await manager.getPullRequestsBatch({
+				providerId: GitCloudHostIntegrationId.AzureDevOps,
+				targets: [target],
+			});
+
+			assert.equal(result.items[0]?.pullRequest?.authoredByMe, true);
+			assert.deepEqual(result.items[0]?.pullRequest?.viewer, { id: 'me' });
+
+			manager.dispose();
+		});
+
+		test('a pull request without an author has unknown authorship, though its reviewers get a viewer', async () => {
+			const { manager, azure } = await connectedAzure(createFakeRuntime());
+			stubCurrentAccount(azure, 'me');
+			await stubAzureOrganizationUser(azure, 'me');
+			const me = { id: 'me', name: 'Me', email: null, username: 'me', avatarUrl: null, url: null };
+			await stubSdkPullRequestFn(manager, GitCloudHostIntegrationId.AzureDevOps, () =>
+				Promise.resolve({
+					data: providerPr('7', {
+						number: 7,
+						author: null,
+						reviews: [{ reviewer: me, state: GitPullRequestReviewState.ReviewRequested }],
+					}),
+				}),
+			);
+
+			const result = await manager.getPullRequestsBatch({
+				providerId: GitCloudHostIntegrationId.AzureDevOps,
+				targets: [target],
+			});
+
+			assert.equal(result.items[0]?.pullRequest?.authoredByMe, undefined, 'unknown, not "someone else\'s"');
+			assert.deepEqual(result.items[0]?.pullRequest?.viewer, { id: 'me' });
 
 			manager.dispose();
 		});
@@ -1834,6 +1923,7 @@ suite('IntegrationManager.getPullRequestsBatch etags', () => {
 			result.warnings.map(w => w.message),
 			['full read exploded'],
 		);
+		assert.deepEqual(result.warnings[0].targetKeys, ['failed']);
 
 		manager.dispose();
 	});
@@ -1877,6 +1967,11 @@ suite('IntegrationManager.getPullRequestsBatch etags', () => {
 				result.warnings.map(w => w.kind),
 				[kind],
 			);
+			assert.deepEqual(
+				result.warnings.map(w => w.targetKeys),
+				[['failed']],
+				'only the target whose check was refused is named',
+			);
 
 			manager.dispose();
 		});
@@ -1908,6 +2003,11 @@ suite('IntegrationManager.getPullRequestsBatch etags', () => {
 		assert.deepEqual(
 			result.warnings.map(w => w.kind),
 			['rate-limit'],
+		);
+		assert.deepEqual(
+			result.warnings[0].targetKeys,
+			['held1', 'held2'],
+			'every target the failed check held is named, not the ones read in full',
 		);
 
 		manager.dispose();

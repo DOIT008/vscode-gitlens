@@ -353,6 +353,7 @@ export class GlDetailsWipHeader extends LitElement {
 				mark="review"
 				placement="bottom"
 				.anchor=${this.queryHeaderTitle}
+				.bodyContext=${{ aiEnabled: this.aiEnabled }}
 				?auto-show=${eligible && context === 'review'}
 			></gl-graph-coachmark>
 			<gl-graph-coachmark
@@ -430,7 +431,8 @@ export class GlDetailsWipHeader extends LitElement {
 	};
 
 	private computeWipModes(): ('review' | 'compose' | 'resolve')[] {
-		if (!this.aiEnabled) return [];
+		// Review is a reading walk first; only compose and resolve are AI through and through.
+		if (!this.aiEnabled) return ['review'];
 		// Surface the Resolve toggle only when the WIP has conflicts (a paused merge/rebase) —
 		// resolve operates on the conflicted-file set, so it's meaningless otherwise. It leads
 		// the cluster when present: resolving is the primary action for a conflicted WIP.
@@ -619,7 +621,6 @@ export class GlDetailsWipHeader extends LitElement {
 	private renderIssueChip(i: OverviewBranchIssue, associated: boolean) {
 		const hasNumericId = !isNaN(parseInt(i.id, 10));
 		const identifier = hasNumericId ? `#${i.id}` : i.id;
-		const status = i.state === 'closed' ? 'closed' : 'opened';
 		const type: 'issue' | 'autolink' = associated ? 'issue' : 'autolink';
 
 		const chip = html`<gl-autolink-chip
@@ -627,7 +628,7 @@ export class GlDetailsWipHeader extends LitElement {
 			name=${i.title}
 			url=${i.url}
 			identifier=${identifier}
-			status=${status}
+			.status=${i.state}
 			openOnRemote
 		></gl-autolink-chip>`;
 

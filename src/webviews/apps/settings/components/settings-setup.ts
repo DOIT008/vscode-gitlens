@@ -44,8 +44,6 @@ declare global {
 /** One resolved launchpad step, computed from the live shared-service signals each render. */
 interface SetupStep {
 	key: string;
-	/** Rail/icon accent — the purple→blue brand sweep position for this step. */
-	accent: string;
 	icon: string;
 	title: string;
 	why: string;
@@ -93,7 +91,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 					color-mix(in srgb, var(--gl-brand-blue) 10%, transparent) 45%,
 					transparent 78%
 				);
-				border-block-end: var(--gl-border-width) solid var(--vscode-widget-border, var(--color-foreground--25));
+				border-block-end: var(--gl-border-width) solid var(--gl-color-divider-base);
 			}
 
 			.hero--started {
@@ -136,7 +134,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 				margin: var(--gl-space-2) 0 0;
 				font-size: 1.2rem;
 				line-height: 1.5;
-				color: var(--color-foreground--75);
+				color: var(--vscode-descriptionForeground);
 			}
 
 			.hero__ring {
@@ -160,7 +158,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 				position: absolute;
 				inset: 0.5rem;
 				content: '';
-				background: var(--color-background);
+				background: var(--gl-color-surface-base);
 				border-radius: 50%;
 			}
 
@@ -169,7 +167,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 				font-family: var(--vscode-editor-font-family);
 				font-size: 1.2rem;
 				font-weight: var(--gl-font-weight-semibold);
-				color: var(--color-foreground--65);
+				color: var(--vscode-descriptionForeground);
 			}
 
 			.hero--started .hero__ring-count {
@@ -233,8 +231,8 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 				appearance: none;
 				cursor: pointer;
 				background: transparent;
-				border: var(--gl-border-width) solid var(--vscode-widget-border, var(--color-foreground--25));
-				border-inline-start: 2px solid var(--step-accent, var(--color-foreground--25));
+				border: var(--gl-border-width) solid var(--gl-color-border-raised);
+				border-inline-start: 2px solid var(--step-accent, var(--gl-color-border-raised));
 				border-radius: var(--gl-radius-md);
 			}
 
@@ -248,8 +246,8 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			}
 
 			.step--done {
-				background: color-mix(in srgb, var(--gl-stat-added) 5%, transparent);
-				border-inline-start-color: var(--gl-stat-added);
+				background: color-mix(in srgb, var(--gl-color-feedback-success-quiet-fg) 5%, transparent);
+				border-inline-start-color: var(--gl-color-feedback-success-quiet-fg);
 			}
 
 			/* Per-step purple→blue rail/icon accent, by position — static CSS for the same
@@ -281,11 +279,11 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			.step__icon {
 				flex: none;
 				font-size: 1.6rem;
-				color: var(--step-accent, var(--color-foreground--65));
+				color: var(--step-accent, var(--vscode-descriptionForeground));
 			}
 
 			.step--done .step__icon {
-				color: var(--gl-stat-added);
+				color: var(--gl-color-feedback-success-quiet-fg);
 			}
 
 			.step__body {
@@ -301,14 +299,14 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			}
 
 			.step--done .step__title {
-				color: var(--color-foreground--75);
+				color: var(--vscode-descriptionForeground);
 			}
 
 			.step__why {
 				margin-block-start: var(--gl-space-2);
 				font-size: 1.1rem;
 				line-height: 1.45;
-				color: var(--color-foreground--65);
+				color: var(--vscode-descriptionForeground);
 			}
 
 			.step__status {
@@ -317,7 +315,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 				align-items: center;
 				margin-block-start: var(--gl-space-4);
 				font-size: 1.05rem;
-				color: var(--color-foreground--50);
+				color: var(--vscode-descriptionForeground);
 			}
 
 			.step__dot {
@@ -333,7 +331,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			}
 
 			.step--done .step__dot {
-				background: var(--gl-stat-added);
+				background: var(--gl-color-feedback-success-quiet-fg);
 			}
 
 			.step__progress {
@@ -360,19 +358,19 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			}
 
 			.step__action--primary {
-				color: var(--vscode-button-foreground);
-				background: var(--vscode-button-background);
+				color: var(--gl-color-action-primary-fg);
+				background: var(--gl-color-action-primary-bg);
 			}
 
 			.step__action--secondary {
-				color: var(--vscode-button-secondaryForeground, var(--color-foreground));
-				background: var(--vscode-button-secondaryBackground);
+				color: var(--gl-color-action-secondary-fg);
+				background: var(--gl-color-action-secondary-bg);
 			}
 
 			.step__action--quiet {
-				color: var(--color-foreground--75);
+				color: var(--gl-color-action-quiet-fg);
 				background: transparent;
-				border-color: var(--vscode-widget-border, var(--color-foreground--25));
+				border-color: var(--gl-color-action-secondary-border);
 			}
 
 			/* Below the ~520px pane the action drops under the text block; the three lines are kept */
@@ -492,14 +490,13 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 
 	// ── Step builders ──
 
-	private signInStep(index: number): SetupStep {
+	private signInStep(): SetupStep {
 		const sub = this._subscription.subscription.get();
 		const account = sub?.account;
 		const done = account != null;
 
 		return {
 			key: 'account',
-			accent: this.accent(index),
 			icon: account != null ? 'account' : 'sign-in',
 			title: l10n.t('Sign in to unlock GitLens Pro'),
 			why: l10n.t(
@@ -518,14 +515,13 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 		};
 	}
 
-	private integrationsStep(index: number): SetupStep {
+	private integrationsStep(): SetupStep {
 		const integrations = this._state.cloudIntegrations.get();
 		const connected = integrations?.filter(i => i.connected) ?? [];
 		const done = connected.length > 0;
 
 		return {
 			key: 'integrations',
-			accent: this.accent(index),
 			icon: 'plug',
 			title: l10n.t('Bring your PRs and Issues into the IDE'),
 			why: l10n.t(
@@ -541,7 +537,6 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 
 	private walkthroughStep(index: number): SetupStep {
 		return this.buildWalkthroughStep(
-			index,
 			'walkthrough',
 			'gl-gitlens',
 			l10n.t('Take a tour: blame, hovers, and more'),
@@ -552,9 +547,8 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 		);
 	}
 
-	private graphWalkthroughStep(index: number): SetupStep {
+	private graphWalkthroughStep(): SetupStep {
 		return this.buildWalkthroughStep(
-			index,
 			'graph-walkthrough',
 			'gl-graph',
 			l10n.t('Run your whole Git workflow from the Graph'),
@@ -568,7 +562,6 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 	}
 
 	private buildWalkthroughStep(
-		index: number,
 		key: string,
 		icon: string,
 		title: string,
@@ -577,7 +570,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 		labels: Record<string, string>,
 		href: string,
 	): SetupStep {
-		const base = { key: key, accent: this.accent(index), icon: icon, title: title, why: why, href: href } as const;
+		const base = { key: key, icon: icon, title: title, why: why, href: href } as const;
 
 		if (progress == null) {
 			return {
@@ -625,11 +618,6 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 	}
 
 	// ── Helpers ──
-
-	/** Purple→blue brand sweep position for a step (index 0 = purple … index 5 = blue, across the six steps). */
-	private accent(index: number): string {
-		return `color-mix(in srgb, var(--gl-brand-purple), var(--gl-brand-blue) ${index * 20}%)`;
-	}
 
 	private connectedStatus(names: string[]): string {
 		switch (names.length) {

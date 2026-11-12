@@ -29,14 +29,18 @@ export class GitWorktree {
 		public readonly sha?: string,
 		public readonly branch?: GitBranch,
 		public readonly workspaceFolder?: { readonly uri: Uri; readonly name: string },
+		/** The branch name from `git worktree list` (`branch refs/heads/<name>`), present even when no `GitBranch` was matched into `branch` */
+		public readonly branchName?: string,
 	) {}
 
 	get date(): Date | undefined {
 		return this.branch?.date;
 	}
 
-	/** @returns The most recent date among lastModifiedDate, lastAccessedDate, and branch.date */
-	@memoize()
+	/**
+	 * @returns The most recent date among lastModifiedDate, lastAccessedDate, and branch.date. Not memoized: the stamps
+	 * change in place (see `BranchMetadata`)
+	 */
 	get effectiveDate(): Date | undefined {
 		let maxTime: number | undefined;
 
@@ -87,7 +91,7 @@ export class GitWorktree {
 			case 'detached':
 				return `${basename(this.path)} (${shortenRevision(this.sha)})`;
 			default:
-				return this.branch?.name || this.friendlyPath;
+				return this.branch?.name || this.branchName || this.friendlyPath;
 		}
 	}
 
@@ -113,6 +117,7 @@ export class GitWorktree {
 			this.sha,
 			this.branch?.withRepoPath(repoPath, true),
 			this.workspaceFolder,
+			this.branchName,
 		);
 	}
 

@@ -3166,13 +3166,15 @@ export class GitHubApi {
 	): Promise<string | undefined> {
 		const scope = getScopedLogger();
 
-		try {
-			if (!path) {
-				interface QueryResult {
-					repository: { object: GitHubCommitRef } | null | undefined;
-				}
+		// `path` stays for API compatibility; `resolveReferenceForPath` also reports whether the file exists at `ref`
+		if (path) return (await this.resolveReferenceForPath(token, owner, repo, ref, path))?.sha;
 
-				const query = `query resolveReference(
+		try {
+			interface QueryResult {
+				repository: { object: GitHubCommitRef } | null | undefined;
+			}
+
+			const query = `query resolveReference(
 	$owner: String!
 	$repo: String!
 	$ref: String!
@@ -3184,20 +3186,44 @@ export class GitHubApi {
 	}
 }`;
 
-				const rsp = await this.graphql<QueryResult>(
-					undefined,
-					token,
-					query,
-					{
-						owner: owner,
-						repo: repo,
-						ref: ref,
-					},
-					scope,
-				);
-				return rsp?.repository?.object?.oid ?? undefined;
-			}
+			const rsp = await this.graphql<QueryResult>(
+				undefined,
+				token,
+				query,
+				{
+					owner: owner,
+					repo: repo,
+					ref: ref,
+				},
+				scope,
+			);
+			return rsp?.repository?.object?.oid ?? undefined;
+		} catch (ex) {
+			if (ex instanceof RequestNotFoundError) return undefined;
 
+			throw this.handleException(ex, undefined, scope);
+		}
+	}
+
+	@trace({
+		args: (token, owner, repo, ref, path) => ({
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			ref: ref,
+			path: path,
+		}),
+	})
+	async resolveReferenceForPath(
+		token: GitHubTokenInfo,
+		owner: string,
+		repo: string,
+		ref: string,
+		path: string,
+	): Promise<{ sha: string; exists: boolean } | undefined> {
+		const scope = getScopedLogger();
+
+		try {
 			interface QueryResult {
 				repository:
 					| {
@@ -3206,16 +3232,18 @@ export class GitHubApi {
 									nodes: GitHubCommitRef[];
 								};
 							};
+							file: { oid: string } | null | undefined;
 					  }
 					| null
 					| undefined;
 			}
 
-			const query = `query resolveReference(
+			const query = `query resolveReferenceForPath(
 	$owner: String!
 	$repo: String!
 	$ref: String!
 	$path: String!
+	$refPath: String!
 ) {
 	repository(owner: $owner, name: $repo) {
 		object(expression: $ref) {
@@ -3224,6 +3252,9 @@ export class GitHubApi {
 					nodes { oid }
 				}
 			}
+		}
+		file: object(expression: $refPath) {
+			oid
 		}
 	}
 }`;
@@ -3237,10 +3268,15 @@ export class GitHubApi {
 					repo: repo,
 					ref: ref,
 					path: path,
+					refPath: `${ref}:${path}`,
 				},
 				scope,
 			);
-			return rsp?.repository?.object?.history.nodes?.[0]?.oid ?? undefined;
+
+			const sha = rsp?.repository?.object?.history.nodes?.[0]?.oid;
+			if (sha == null) return undefined;
+
+			return { sha: sha, exists: rsp?.repository?.file != null };
 		} catch (ex) {
 			if (ex instanceof RequestNotFoundError) return undefined;
 
@@ -3573,6 +3609,23 @@ export class GitHubApi {
 				return allowPartialNotFound === 'aliased' ? { data: data, errors: [] } : data;
 			} catch (ex) {
 				if (ex instanceof GraphqlResponseError) {
+					// Throttling is a fact about the whole request, so it wins over whichever error happens to be first,
+					// and over an alias it happens to name. GitHub answers 200 + `RATE_LIMIT` (code `graphql_rate_limit`)
+					// when the primary limit is exhausted.
+					if (ex.errors?.some(e => e.type === 'RATE_LIMIT' || e.type === 'RATE_LIMITED')) {
+						let resetAt: number | undefined;
+
+						const reset = ex.headers?.['x-ratelimit-reset'];
+						if (reset != null) {
+							resetAt = parseInt(reset, 10);
+							if (Number.isNaN(resetAt)) {
+								resetAt = undefined;
+							}
+						}
+
+						throw new RequestRateLimitError(ex, accessToken, resetAt);
+					}
+
 					if (
 						allowPartialNotFound === 'aliased' &&
 						ex.data != null &&
@@ -3581,8 +3634,8 @@ export class GitHubApi {
 					) {
 						// Every alias-scoped error's `path[0]` names a top-level key in `ex.data` — these queries
 						// have no other top-level fields. An error with no `path`, or naming something outside
-						// `data` (rate limits, bad credentials, query-cost errors), isn't alias-scoped and falls
-						// through to the whole-request classification below, unchanged.
+						// `data` (bad credentials, query-cost errors), isn't alias-scoped and falls through to the
+						// whole-request classification below, unchanged.
 						const aliasScoped = ex.errors.every(
 							e => e.path != null && e.path.length > 0 && e.path[0] in (ex.data as object),
 						);
@@ -3594,21 +3647,6 @@ export class GitHubApi {
 							throw new RequestNotFoundError(ex);
 						case 'FORBIDDEN':
 							throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Forbidden, ex);
-						// GitHub answers 200 + `RATE_LIMIT` (code `graphql_rate_limit`) when the primary limit is exhausted
-						case 'RATE_LIMIT':
-						case 'RATE_LIMITED': {
-							let resetAt: number | undefined;
-
-							const reset = ex.headers?.['x-ratelimit-reset'];
-							if (reset != null) {
-								resetAt = parseInt(reset, 10);
-								if (Number.isNaN(resetAt)) {
-									resetAt = undefined;
-								}
-							}
-
-							throw new RequestRateLimitError(ex, accessToken, resetAt);
-						}
 					}
 
 					if (Logger.isDebugging) {
@@ -3827,6 +3865,7 @@ export class GitHubApi {
 									: l10n.t('{0} failed to respond and might be experiencing issues.', provider.name),
 							),
 						deferFailure,
+						token.connectionId,
 					);
 				}
 				return;
@@ -3839,6 +3878,7 @@ export class GitHubApi {
 						ex,
 						() => this.config.onRequestError?.(provider, `${provider?.name ?? 'GitHub'} request timed out`),
 						deferFailure,
+						token.connectionId,
 					);
 					return;
 				}
@@ -3859,6 +3899,7 @@ export class GitHubApi {
 								: l10n.t('{0} failed to respond and might be experiencing issues.', provider.name),
 						),
 					deferFailure,
+					token.connectionId,
 				);
 				return;
 			default:

@@ -351,8 +351,9 @@ export class GraphWipService {
 					// CLI, ignoring/un-ignoring files, rebase progress, fetch/publish) only surface
 					// via the structural `onDidChange` event — mirror the WIP triggers the primary
 					// fires from `onRepositoryChanged` (see `index`/`ignores` and
-					// `head`/`heads`/`remotes`) so the secondary panel stays reactive to those same
-					// changes.
+					// `head`/`heads`/`remotes`/`config` — a branch-only `.git/config` write, like setting an
+					// upstream, comes as `config` alone) so the secondary panel stays reactive to those
+					// same changes.
 					watcher.onDidChange(e => {
 						if (!e.changed('index', 'ignores', 'pausedOp', 'head', 'heads', 'remotes', 'config')) return;
 
@@ -929,7 +930,7 @@ export class GraphWipService {
 		const repo = this.repository;
 		if (repo == null) return result;
 
-		const worktrees = await repo.git.worktrees?.getWorktrees(toAbortSignal(cancellation));
+		const worktrees = await repo.git.worktrees?.getWorktrees(undefined, toAbortSignal(cancellation));
 		if (!worktrees?.length) return result;
 
 		// Cheap clean/dirty probe per secondary worktree — ONLY when `probeChanges` is set (the
@@ -1253,12 +1254,25 @@ export class GraphWipService {
 		// (`buildBranchContextSuffix`), so the menus can't drift — including `+worktree`, which follows
 		// the branch's actual worktree (non-default ones only) rather than this row's secondary status.
 		const pinnedRefId = this.context.getPinnedRefId(repo.path);
+		// Per repo (cached by the provider) so the Publish Branch / Publish Repository pick is right in a
+		// multi-repo workspace. Degrades like the branch read above rather than rejecting.
+		let hasRemotes = false;
+		if (branch != null) {
+			try {
+				hasRemotes = (await repo.git.remotes.getRemotes(undefined, signal)).length > 0;
+			} catch (ex) {
+				signal?.throwIfAborted();
+				Logger.error(ex, 'graph: failed to get remotes for WIP');
+			}
+		}
+		signal?.throwIfAborted();
 		const branchContext =
 			branch != null
 				? serializeWebviewItemContext<GraphItemContext>({
 						webviewItem: buildBranchContextSuffix(branch, {
 							isCheckedOut: isSecondaryWorktree,
 							pinnedRefId: pinnedRefId,
+							hasRemotes: hasRemotes,
 						}),
 						webviewItemValue: {
 							type: 'branch',

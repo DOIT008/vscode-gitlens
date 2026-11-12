@@ -1,14 +1,13 @@
-import type { ExecFileException, ExecFileOptions } from 'child_process';
-import { exec, execFile, spawn } from 'child_process';
+import type { ChildProcess, ExecFileException, ExecFileOptions } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import type { Stats } from 'fs';
 import { access, constants } from 'fs';
 import { stat } from 'fs/promises';
 import { join as joinPaths } from 'path';
 import * as process from 'process';
-import type { Writable } from 'stream';
+import type { Readable, Writable } from 'stream';
 import type { CancellationReason } from '../../cancellation.js';
 import { getScopedLogger, maybeStartScopedLogger } from '../../logger.scoped.js';
-import { normalizePath } from '../../path.js';
 import { isWindows } from './platform.js';
 
 // -- Error types --
@@ -175,17 +174,88 @@ export async function findExecutable(exe: string, args: string[]): Promise<{ cmd
 	return { cmd: exe, args: args };
 }
 
-export async function getWindowsShortPath(path: string): Promise<string> {
-	return new Promise<string>((resolve, reject) => {
-		exec(`for %I in ("${path}") do @echo %~sI`, (error, stdout, _stderr) => {
-			if (error != null) {
-				reject(error);
-				return;
-			}
+/** What core uses of a spawned process; Node's `ChildProcess` satisfies it */
+export interface SpawnedProcess {
+	readonly stdin: Writable | null;
+	readonly stdout: Readable | null;
+	readonly stderr: Readable | null;
+	readonly killed: boolean;
+	readonly exitCode: number | null;
+	readonly spawnargs: string[];
+	once(event: 'error', listener: (error: Error) => void): this;
+	once(event: 'close', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+	removeAllListeners(): this;
+}
 
-			resolve(normalizePath(stdout.trim()));
-		});
-	});
+export interface ProcessSpawnOptions {
+	readonly cwd?: string;
+	/** The child's whole environment, not additions to the spawner's own; an `undefined` value leaves the key out */
+	readonly env?: Record<string, string | undefined>;
+	/** Milliseconds; absent means none */
+	readonly timeout?: number;
+	readonly signal?: AbortSignal;
+	/** A `null` entry means `'pipe'` */
+	readonly stdio?: ['pipe' | 'ignore', null, null];
+}
+
+/**
+ * Launches a process in place of Node's `spawn`, and must behave as it does:
+ * - pipe stdout and stderr, and stdin unless `stdio[0]` is `'ignore'`, which leaves `stdin` null
+ * - honour `signal`, including one already aborted: kill with SIGTERM, then emit `'error'` with `name` `AbortError`,
+ *   unless the process has already exited
+ * - honour `timeout`: kill with SIGTERM and set `killed`, without emitting `'error'`
+ * - report a killed process's `'close'` with a null code and its signal, not an exit code such as 143
+ * - emit no event before returning, `'error'` at most once, and `'close'` exactly once and last: also after `'error'`
+ *   (a failed launch, an abort), and only after `stdout` and `stderr` have ended or been destroyed, with `exitCode`
+ *   and `killed` already set
+ * - close the child's stdout when `stdout` is destroyed, which is how a reader that stops early ends the process
+ */
+export type ProcessSpawner = (command: string, args: readonly string[], options: ProcessSpawnOptions) => SpawnedProcess;
+
+/**
+ * The default {@link ProcessSpawner}: Node's `spawn`, but with its `timeout` handled here. Node clears its timeout
+ * timer only on `'exit'`, which a failed launch (e.g. a missing `cwd`) never emits, so the timer outlives the
+ * process and keeps Node alive for the full timeout. This mirrors Node's timeout handling but also clears on
+ * `'close'`, as https://github.com/nodejs/node/pull/65506 does; remove it once the minimum supported Node/Electron
+ * includes that fix.
+ */
+export function spawnProcess(command: string, args: readonly string[], options: ProcessSpawnOptions): ChildProcess {
+	const { timeout, ...spawnOptions } = options;
+	// Node's own validation, thrown before anything spawns
+	if (timeout != null && !(Number.isInteger(timeout) && timeout >= 0)) {
+		const ex = new RangeError(
+			`The value of "timeout" is out of range. It must be an unsigned integer. Received ${String(timeout)}`,
+		);
+		(ex as RangeError & { code: string }).code = 'ERR_OUT_OF_RANGE';
+		throw ex;
+	}
+
+	const child = spawn(command, args, spawnOptions);
+
+	if (timeout != null && timeout > 0) {
+		let timeoutId: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
+			if (timeoutId != null) {
+				try {
+					child.kill();
+				} catch (ex) {
+					child.emit('error', ex);
+				}
+				timeoutId = undefined;
+			}
+		}, timeout);
+
+		const clear = () => {
+			if (timeoutId != null) {
+				clearTimeout(timeoutId);
+				timeoutId = undefined;
+			}
+		};
+		// `'exit'` keeps Node's timing; `'close'` covers a launch that fails and never exits
+		child.once('exit', clear);
+		child.once('close', clear);
+	}
+
+	return child;
 }
 
 export interface RunOptions<TEncoding = BufferEncoding | 'buffer'> {
@@ -224,6 +294,8 @@ export interface RunOptions<TEncoding = BufferEncoding | 'buffer'> {
 	 * Use for commands whose failure is expected (e.g. paired with `errors: 'ignore'`).
 	 */
 	readonly quiet?: boolean;
+	/** Launches the process; defaults to {@link spawnProcess}. Only used by `runSpawn` */
+	readonly spawn?: ProcessSpawner;
 }
 
 const bufferExceededRegex = /stdout maxBuffer( length)? exceeded/;
@@ -400,17 +472,24 @@ export function runSpawn<T extends string | Buffer>(
 ): Promise<RunExitResult | RunResult<T>> {
 	const scope = getScopedLogger() ?? maybeStartScopedLogger('Exec.runSpawn');
 
-	const { stdin, stdinEncoding, cancellation, decode, ...opts }: RunOptions = options;
+	const { stdin, stdinEncoding, cancellation, decode, spawn: spawner, ...opts }: RunOptions = options;
 
 	const promise = new Promise<RunExitResult | RunResult<T>>((resolve, reject) => {
-		const proc = spawn(command, args, { ...opts, signal: cancellation });
+		const proc = (spawner ?? spawnProcess)(command, args, {
+			cwd: opts.cwd,
+			env: opts.env,
+			// 0 disables it, which the spawner contract spells as absent
+			timeout: opts.timeout === 0 ? undefined : opts.timeout,
+			signal: cancellation,
+			stdio: ['pipe', null, null],
+		});
 		const errorEncoding = encoding === 'buffer' ? 'utf8' : encoding;
 
 		const stdoutBuffers: Buffer[] = [];
-		proc.stdout.on('data', (data: Buffer) => stdoutBuffers.push(data));
+		proc.stdout?.on('data', (data: Buffer) => stdoutBuffers.push(data));
 
 		const stderrBuffers: Buffer[] = [];
-		proc.stderr.on('data', (data: Buffer) => stderrBuffers.push(data));
+		proc.stderr?.on('data', (data: Buffer) => stderrBuffers.push(data));
 
 		function getStdio<T>(
 			encoding: BufferEncoding | 'buffer' | string,
@@ -512,6 +591,11 @@ export function runSpawn<T extends string | Buffer>(
 			// branch, which is where a codeless result can genuinely surface.)
 			resolve({ exitCode: code ?? undefined, signal: signal ?? undefined, stdout: stdout, stderr: stderr });
 		});
+
+		// Only a host spawner can leave these out; reading no output as empty would pass for a clean answer
+		if (proc.stdout == null || proc.stderr == null) {
+			reject(new Error(`'${command}' was spawned without stdout and stderr pipes`));
+		}
 
 		if (stdin != null) {
 			endStdin(proc.stdin, stdin, stdinEncoding);

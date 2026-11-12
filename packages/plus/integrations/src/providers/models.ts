@@ -34,6 +34,7 @@ import type {
 	JiraServerProject,
 	Linear,
 	LinearOrganization,
+	LinearProject,
 	LinearTeam,
 	NumberedPageInput,
 	Organization,
@@ -45,17 +46,18 @@ import type {
 	SetPullRequestInput,
 	Trello,
 } from '@gitkraken/provider-apis';
-import { EntityIdentifierUtils } from '@gitkraken/provider-apis/entity-identifiers';
-import { GitProviderUtils } from '@gitkraken/provider-apis/provider-utils';
+import { EntityIdentifierUtils, GitProviderUtils } from '@gitkraken/provider-apis';
 import { githubSearchResultLimit } from '@gitlens/git-github/api/config.js';
 import type { Account as UserAccount } from '@gitlens/git/models/author.js';
 import type {
+	IssueBodyField,
 	IssueIteration,
 	IssueProject,
 	IssueProjection,
 	IssueProviderState,
 	IssueShape,
 	IssueStateFilter,
+	IssueSyncedWith,
 } from '@gitlens/git/models/issue.js';
 import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
 import type {
@@ -73,6 +75,7 @@ import {
 } from '@gitlens/git/models/pullRequest.js';
 import type { Provider, ProviderReference } from '@gitlens/git/models/remoteProvider.js';
 import type { ProviderScope } from '@gitlens/git/models/resourceDescriptor.js';
+import { isTerminalIssueStateCategory } from '@gitlens/git/utils/issue.utils.js';
 import { gitSuffixRegex } from '@gitlens/git/utils/remote.utils.js';
 import type { PagedResult } from '@gitlens/utils/paging.js';
 import { equalsIgnoreCase } from '@gitlens/utils/string.js';
@@ -105,6 +108,7 @@ export type {
 	PullRequestSorting,
 } from '../providerFilters.js';
 import type { ProviderRepositoryShape } from '../results.js';
+import { isJiraIntegrationId } from '../utils/integration.utils.js';
 
 export type { ProviderOrganization, ProviderRepositoryShape } from '../results.js';
 import { fromProviderAccount, toProviderAccount } from './accounts.js';
@@ -238,6 +242,8 @@ export type ProviderJiraResource = JiraResource;
 export type ProviderJiraServerProject = JiraServerProject;
 export type ProviderLinearTeam = LinearTeam;
 export type ProviderLinearOrganization = LinearOrganization;
+// Linear's own `Project` entity, which can span several teams; not the teams core lists as a tracker's projects.
+export type ProviderLinearProject = LinearProject;
 export type ProviderAzureProject = AzureProject;
 export type ProviderAzureResource = AzureOrganization;
 export type ProviderBitbucketResource = BitbucketWorkspaceStub;
@@ -660,6 +666,7 @@ export type GetLinearTeamsForCurrentUserFn = (options?: EnterpriseOptions) => Pr
 // Derived from the client method, like the Jira reads below, so a filter the SDK adds (`assignees`, `states`)
 // reaches the type system instead of being smuggled through `getPagedResult`'s `any`.
 export type GetLinearIssuesFn = Linear['getIssues'];
+export type GetLinearProjectsFn = Linear['getProjects'];
 /**
  * Linear's current-user (viewer) query. Its raw `@linear/sdk` User isn't a `ProviderAccount` (no
  * username/avatar/url), so it's typed with the minimal fields the viewer query actually returns rather than
@@ -726,6 +733,15 @@ export type GetBitbucketServerPullRequestsForCurrentUserFn = (
 	};
 	data: GitPullRequest[];
 }>;
+/**
+ * One page of a Jira issue search; `nextCursor` is the raw provider cursor, fed back verbatim. `metadata` is the
+ * SDK's: a page that dropped an issue it could not read reports it there as `partial` with a `provider` failure
+ * (GKDEV-3652).
+ */
+export type JiraIssuePage =
+	| { data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined; metadata?: CollectionMetadata }
+	| undefined;
+
 export type GetIssuesForProjectFn = Jira['getIssuesForProject'];
 // Jira Server's own reads, derived from its client rather than shared with Cloud's: every one of them is
 // addressed by the instance's `baseUrl`/`resourceUrl` instead of Cloud's `resourceId`, and its project read is
@@ -774,6 +790,7 @@ export interface ProviderInfo extends ProviderMetadata {
 	getLinearOrganizationFn?: GetLinearOrganizationFn;
 	getLinearTeamsForCurrentUserFn?: GetLinearTeamsForCurrentUserFn;
 	getLinearIssuesFn?: GetLinearIssuesFn;
+	getLinearProjectsFn?: GetLinearProjectsFn;
 	getLinearCurrentUserFn?: GetLinearCurrentUserFn;
 	getAzureResourcesForUserFn?: GetAzureResourcesForUserFn;
 	getBitbucketResourcesForCurrentUserFn?: GetBitbucketResourcesForCurrentUserFn;
@@ -881,8 +898,7 @@ export interface ProviderMetadata {
 	 */
 	supportedAccountWideIssueSorts?: IssueSorting[];
 	/**
-	 * Whether an issue tracker's reads (the project-scoped read, which is `listIssueTrackerIssuesPage`, and its
-	 * account-wide read) can be asked for a `state` other than open, and honor it server-side.
+	 * Whether issue list reads (including Azure project/repository and account-wide reads) can be asked for a `state` other than open, and honor it server-side.
 	 *
 	 * A tracker read is open-only unless asked otherwise, so absent does not mean the read returns every state: it
 	 * means only `'open'` is expressible, and `'closed'`/`'all'` are refused rather than served as the open list.
@@ -1200,6 +1216,7 @@ export const providersMetadata: ProvidersMetadata = {
 		name: 'Bitbucket Data Center',
 		type: 'git',
 		iconKey: GitSelfManagedHostIntegrationId.BitbucketServer,
+		pullRequestsPagingMode: PagingMode.Repo,
 		supportedPullRequestFilters: [PullRequestFilter.Author, PullRequestFilter.ReviewRequested],
 		supportedAccountWidePullRequestFilters: [PullRequestFilter.Author, PullRequestFilter.ReviewRequested],
 		supportedPullRequestSearch: bitbucketServerPullRequestSearchCapabilities,
@@ -1207,6 +1224,7 @@ export const providersMetadata: ProvidersMetadata = {
 		scopes: ['Project (Read)', 'Repository (Write)'],
 	},
 	[GitCloudHostIntegrationId.AzureDevOps]: {
+		supportsIssueStates: true,
 		domain: 'dev.azure.com',
 		id: GitCloudHostIntegrationId.AzureDevOps,
 		name: 'Azure DevOps',
@@ -1238,6 +1256,7 @@ export const providersMetadata: ProvidersMetadata = {
 		scopes: ['vso.code', 'vso.identity', 'vso.project', 'vso.profile', 'vso.work'],
 	},
 	[GitSelfManagedHostIntegrationId.AzureDevOpsServer]: {
+		supportsIssueStates: true,
 		domain: '',
 		id: GitSelfManagedHostIntegrationId.AzureDevOpsServer,
 		name: 'Azure DevOps Server',
@@ -1281,6 +1300,7 @@ export const providersMetadata: ProvidersMetadata = {
 		scopes: [
 			'read:status:jira',
 			'read:application-role:jira',
+			'read:attachment:jira',
 			'write:attachment:jira',
 			'read:comment:jira',
 			'read:project-category:jira',
@@ -1346,13 +1366,14 @@ export const providersMetadata: ProvidersMetadata = {
 		type: 'issues',
 		iconKey: IssuesCloudHostIntegrationId.Linear,
 		scopes: [],
-		// Linear scopes "my issues" client-side by the viewer's assignee id; author/mention aren't supported.
+		// The user-scoped tracker read scopes Linear's "my issues" by the viewer's id: assigned issues, plus the
+		// GitHub-synced issues the viewer created unless `Assignee` is asked for by name. Author/mention aren't supported.
 		supportedIssueFilters: [IssueFilter.Assignee],
 		// Both directions, and one table for both reads: they are the same root `issues` query taking the same
 		// `sort` argument, so there is no account-wide narrowing to declare.
 		supportedIssueSorts: linearIssueSorts,
-		// A workflow-state type clause on both reads (`completed`/`canceled` are closed), the same types the SDK
-		// normalizes to the `DONE` category.
+		// A workflow-state type clause on both reads (`completed`/`canceled`/`duplicate` are closed), the same types
+		// the SDK normalizes to a terminal category (`DONE`, or `CANCELED` for the last two).
 		supportsIssueStates: true,
 	},
 	[IssuesCloudHostIntegrationId.Trello]: {
@@ -1397,24 +1418,39 @@ function toIssueIdentifier(value: string | number): string {
 	return String(value);
 }
 
-function toIssueProviderState(
-	state: ProviderIssue['state'],
-	reliableStateCategory = true,
-): IssueProviderState | undefined {
+function toIssueProviderState(state: ProviderIssue['state']): IssueProviderState | undefined {
 	return state == null
 		? undefined
 		: {
 				id: state.id,
 				name: state.name,
 				color: state.color ?? undefined,
-				category: reliableStateCategory ? state.category : undefined,
+				category: state.category,
 			};
 }
 
+function getProviderIssueState(issue: ProviderIssue, providerId: ProviderReference['id']): IssueShape['state'] {
+	const category = issue.state?.category;
+	if (
+		providerId === GitCloudHostIntegrationId.AzureDevOps ||
+		providerId === GitSelfManagedHostIntegrationId.AzureDevOpsServer
+	) {
+		if (category != null) return isTerminalIssueStateCategory(category) ? 'closed' : 'opened';
+
+		return issue.closedDate != null ? 'closed' : undefined;
+	}
+
+	return issue.closedDate != null || isTerminalIssueStateCategory(category) ? 'closed' : 'opened';
+}
+
+/**
+ * `options.viewer` is the current account as the row's organization identifies it, or `null` where the read tried to
+ * resolve that and couldn't: a row that names someone then gets {@link IssueShape.viewerUnresolved} instead.
+ */
 export function toIssueShape(
 	issue: ProviderIssue,
 	provider: ProviderReference,
-	options?: { reliableStateCategory?: boolean; projection?: IssueProjection },
+	options?: { projection?: IssueProjection; viewer?: { id: string } | null },
 ): IssueShape | undefined {
 	// TODO: Add some protections/baselines rather than killing the transformation here
 	// `author` is intentionally not required: some providers have no per-item creator (e.g. Trello cards,
@@ -1422,16 +1458,7 @@ export function toIssueShape(
 	// Fall back to an empty author instead so these issues still surface.
 	if (issue.updatedDate == null || issue.url == null) return undefined;
 
-	// Jira SDK results derive this category from a localized display name and default unknown names to DONE.
-	// Only the direct point read opts in because it maps Jira's stable status-category key itself. The whole
-	// Jira family shares that mapper (`jiraHelpers` serves Cloud and Server alike), so the gate is keyed on the
-	// family rather than the cloud id — a self-hosted instance in any non-English locale would otherwise report
-	// every open issue as closed.
-	const isJira =
-		provider.id === IssuesCloudHostIntegrationId.Jira ||
-		provider.id === IssuesSelfManagedHostIntegrationId.JiraServer;
-	const reliableStateCategory = !isJira || options?.reliableStateCategory === true;
-	const closed = issue.closedDate != null || (issue.state?.category === 'DONE' && reliableStateCategory);
+	const state = getProviderIssueState(issue, provider.id);
 
 	return {
 		type: 'issue',
@@ -1451,9 +1478,9 @@ export function toIssueShape(
 		createdDate: issue.createdDate,
 		updatedDate: issue.updatedDate,
 		closedDate: issue.closedDate ?? undefined,
-		closed: closed,
-		state: closed ? 'closed' : 'opened',
-		providerState: toIssueProviderState(issue.state, reliableStateCategory),
+		closed: state === 'closed',
+		state: state,
+		providerState: toIssueProviderState(issue.state),
 		author: {
 			id: issue.author?.id ?? '',
 			// An absent name stays absent, matching {@link fromProviderAccount}; see `IssueMember.name`.
@@ -1468,15 +1495,7 @@ export function toIssueShape(
 				avatarUrl: assignee.avatarUrl ?? undefined,
 				url: assignee.url ?? undefined,
 			})) ?? [],
-		project:
-			issue.project?.id && issue.project.resourceId && issue.project.namespace
-				? {
-						id: issue.project.id,
-						name: issue.project.name,
-						resourceId: issue.project.resourceId,
-						resourceName: issue.project.namespace,
-					}
-				: undefined,
+		project: toIssueProject(issue.project, provider),
 		repository:
 			issue.repository?.owner?.login != null
 				? {
@@ -1491,12 +1510,49 @@ export function toIssueShape(
 		thumbsUpCount: issue.upvoteCount ?? undefined,
 		body: issue.description ?? undefined,
 		// Both Jira flavors return `/rest/api/2` wiki markup for the description.
-		bodyFormat: isJira ? 'jira-wiki' : undefined,
+		bodyFormat: isJiraIntegrationId(provider.id) ? 'jira-wiki' : undefined,
+		// Only when known, so a row from any other provider keeps exactly the keys it always had.
+		...(issue.descriptionField != null ? { bodyField: toIssueBodyField(issue.descriptionField) } : {}),
 		issueType: issue.type ?? undefined,
 		iterations: toIssueIterations(issue),
 		// Only when tagged, so an untagged row keeps exactly the keys it always had.
 		...(options?.projection != null ? { projection: options.projection } : {}),
+		...toIssueViewer(issue, options?.viewer),
+		// Only when the provider reports it, so a row from any other provider keeps exactly the keys it always had.
+		...(issue.syncedWith != null ? { syncedWith: toIssueSyncedWith(issue.syncedWith) } : {}),
 	};
+}
+
+function toIssueProject(project: ProviderIssue['project'], provider: ProviderReference): IssueProject | undefined {
+	if (!project?.id || !project.resourceId || (!project.namespace && !isJiraIntegrationId(provider.id))) {
+		return undefined;
+	}
+
+	return {
+		id: project.id,
+		name: project.name,
+		resourceId: project.resourceId,
+		// Jira identifies its site by resourceId; the API need not supply a display name for it.
+		resourceName: project.namespace ?? '',
+	};
+}
+
+function toIssueSyncedWith(syncedWith: NonNullable<ProviderIssue['syncedWith']>): IssueSyncedWith[] {
+	return syncedWith.map(synced =>
+		synced.owner != null
+			? {
+					provider: synced.service,
+					id: synced.id,
+					owner: synced.owner,
+					repo: synced.repo,
+					number: synced.number,
+				}
+			: { provider: synced.service, id: synced.id },
+	);
+}
+
+export function toIssueBodyField(field: NonNullable<ProviderIssue['descriptionField']>): IssueBodyField {
+	return { id: field.referenceName, name: field.name };
 }
 
 function toIssueIterations(issue: ProviderIssue): IssueIteration[] | undefined {
@@ -1831,12 +1887,16 @@ export function toProviderPullRequest(pr: PullRequest): ProviderPullRequest {
 	};
 }
 
+/**
+ * `options.currentAccount` is what `authoredByMe` and `viewer` are resolved against, or `null` where the read tried to
+ * resolve it and couldn't: a row that names someone then gets {@link PullRequestShape.viewerUnresolved} instead.
+ */
 export function fromProviderPullRequest(
 	pr: ProviderPullRequest,
 	provider: Provider,
 	options?: {
 		project?: IssueProject;
-		currentAccount?: { id: string; username?: string };
+		currentAccount?: { id: string; username?: string } | null;
 		projection?: PullRequestProjection;
 	},
 ): PullRequest {
@@ -1917,7 +1977,8 @@ export function fromProviderPullRequest(
 			? authoredByCurrentAccount(pr.author, provider, options.currentAccount)
 			: undefined,
 		options?.projection,
-		options?.currentAccount,
+		options?.currentAccount ?? undefined,
+		options?.currentAccount === null && pullRequestNamesPeople(pr) ? true : undefined,
 	);
 }
 
@@ -1947,10 +2008,11 @@ export function stampNativePullRequest(
 export function toPullRequestRow(
 	pr: ProviderPullRequest | PullRequest,
 	provider: Provider,
-	options: { currentAccount?: { id: string; username?: string }; projection?: PullRequestProjection },
+	options: { currentAccount?: { id: string; username?: string } | null; projection?: PullRequestProjection },
 ): PullRequest {
+	// Only an Azure DevOps viewer can be unresolved, and its rows are never native.
 	return isNativePullRequest(pr)
-		? stampNativePullRequest(pr, options)
+		? stampNativePullRequest(pr, { ...options, currentAccount: options.currentAccount ?? undefined })
 		: fromProviderPullRequest(pr, provider, options);
 }
 
@@ -1965,31 +2027,74 @@ export function isNativePullRequest(pr: ProviderPullRequest | PullRequest): pr i
 }
 
 /**
+ * Whether `pr` names anyone the current account could be: its author, an assignee or a reviewer. A row naming no one
+ * needs no viewer, as nothing on it can be matched against one.
+ */
+export function pullRequestNamesPeople(pr: ProviderPullRequest | PullRequest): boolean {
+	if (pr.author != null || pr.assignees?.length) return true;
+
+	return isNativePullRequest(pr)
+		? Boolean(pr.reviewRequests?.length || pr.latestReviews?.length)
+		: Boolean(pr.reviews?.length);
+}
+
+/**
+ * The viewer fields of an issue row naming `issue`'s people, from what its read resolved: `viewer` when it resolved
+ * one, `viewerUnresolved` when it tried and couldn't (`null`), and neither for a row that names no one, as nothing on
+ * it can be matched. Only the keys it sets, so a row resolved as before keeps exactly the keys it always had.
+ */
+export function toIssueViewer(
+	issue: Parameters<typeof issueNamesPeople>[0],
+	viewer: { id: string } | null | undefined,
+): { viewer?: { id: string }; viewerUnresolved?: true } | undefined {
+	if (viewer === undefined || !issueNamesPeople(issue)) return undefined;
+
+	return viewer != null ? { viewer: viewer } : { viewerUnresolved: true };
+}
+
+/**
+ * Whether `issue` names anyone the current account could be: its author or an assignee, by id. A row naming no one
+ * gets no viewer, as nothing on it can be matched against one. Takes a raw row or a mapped one, so every read decides
+ * alike.
+ */
+export function issueNamesPeople(issue: {
+	readonly author?: { readonly id?: string | null } | null;
+	readonly assignees?: readonly { readonly id?: string | null }[] | null;
+}): boolean {
+	return Boolean(issue.author?.id || issue.assignees?.some(a => a.id));
+}
+
+/**
  * GitLens' own GitHub GraphQL client keys people by login, while the current account's `id` is GitHub's
  * numeric database id, so an id-only match always misses there. The login is a unique handle on every
  * GitHub row shape, so the username fallback is safe there; elsewhere `toProviderAccount` fills `username`
  * from a display name that two people can share, so only GitHub and GitHub Enterprise get the fallback.
+ *
+ * A row without an author is unknown (`undefined`), not someone else's: it can still get a viewer for its reviewers.
  */
 function authoredByCurrentAccount(
 	author: { id?: string | null; username?: string | null } | null | undefined,
 	provider: ProviderReference,
 	currentAccount: { id: string; username?: string },
-): boolean {
-	if (author?.id === currentAccount.id) return true;
+): boolean | undefined {
+	if (author == null) return undefined;
+	if (author.id === currentAccount.id) return true;
 
 	const isGitHub =
 		provider.id === GitCloudHostIntegrationId.GitHub ||
 		provider.id === GitSelfManagedHostIntegrationId.CloudGitHubEnterprise;
-	return isGitHub && currentAccount.username != null && author?.username === currentAccount.username;
+	return isGitHub && currentAccount.username != null && author.username === currentAccount.username;
 }
 
+/** `options.viewer` as {@link toIssueShape} takes it. */
 export function fromProviderIssue(
 	issue: ProviderIssue,
 	integration: Integration,
-	options?: { project?: IssueProject; projection?: IssueProjection },
+	options?: { project?: IssueProject; projection?: IssueProjection; viewer?: { id: string } | null },
 ): Issue {
 	const identifier = toIssueIdentifier(issue.number);
-	const closed = issue.closedDate != null || issue.state?.category === 'DONE';
+	const state = getProviderIssueState(issue, integration.id);
+	const viewer = toIssueViewer(issue, options?.viewer);
 	return new Issue(
 		integration,
 		identifier,
@@ -1998,8 +2103,8 @@ export function fromProviderIssue(
 		issue.url ?? '',
 		issue.createdDate,
 		issue.updatedDate ?? issue.closedDate ?? issue.createdDate,
-		closed,
-		closed ? 'closed' : 'opened',
+		state === 'closed',
+		state,
 		fromProviderAccount(issue.author),
 		issue.assignees?.map(fromProviderAccount) ?? undefined,
 		issue.repository != null
@@ -2022,20 +2127,17 @@ export function fromProviderIssue(
 					resourceId: options.project.resourceId,
 					resourceName: options.project.resourceName,
 				}
-			: issue.project?.id && issue.project?.resourceId && issue.project?.namespace
-				? {
-						id: issue.project.id,
-						name: issue.project.name,
-						resourceId: issue.project.resourceId,
-						resourceName: issue.project.namespace,
-					}
-				: undefined,
+			: toIssueProject(issue.project, integration),
 		identifier,
 		issue.type ?? undefined,
-		toIssueProviderState(issue.state, integration.id !== IssuesCloudHostIntegrationId.Jira),
+		toIssueProviderState(issue.state),
 		integration.id === IssuesCloudHostIntegrationId.Jira ? 'jira-wiki' : undefined,
 		toIssueIterations(issue),
 		options?.projection,
+		issue.descriptionField != null ? toIssueBodyField(issue.descriptionField) : undefined,
+		viewer?.viewer,
+		viewer?.viewerUnresolved,
+		issue.syncedWith != null ? toIssueSyncedWith(issue.syncedWith) : undefined,
 	);
 }
 

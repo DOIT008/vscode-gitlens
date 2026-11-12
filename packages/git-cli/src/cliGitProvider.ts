@@ -1,29 +1,46 @@
 import { promises as fs } from 'node:fs';
+import { homedir } from 'node:os';
 import * as path from 'node:path';
-import type { CachedGitTypes } from '@gitlens/git/cache.js';
-import { Cache } from '@gitlens/git/cache.js';
+import { env } from 'node:process';
+import type { CachedGitTypes, MergeTargetsChangeEvent } from '@gitlens/git/cache.js';
+import { Cache, resetDropsPendingRuns } from '@gitlens/git/cache.js';
 import type { GitServiceContext } from '@gitlens/git/context.js';
 import type { GitFileStatus } from '@gitlens/git/models/fileStatus.js';
 import type { RepositoryChange } from '@gitlens/git/models/repository.js';
 import { deletedOrMissing } from '@gitlens/git/models/revision.js';
 import type { GitOperationRunOptions } from '@gitlens/git/providers/operations.js';
-import type { GitProvider, GitProviderDescriptor } from '@gitlens/git/providers/provider.js';
+import type {
+	AnnouncedRepositoryChanges,
+	GitProvider,
+	GitProviderDescriptor,
+} from '@gitlens/git/providers/provider.js';
+import type { GitCommandPriority } from '@gitlens/git/run.types.js';
 import { parseGitRemoteUrl } from '@gitlens/git/utils/remote.utils.js';
 import { isUncommitted } from '@gitlens/git/utils/revision.utils.js';
+import { getRefChangeKind } from '@gitlens/git/watching/changeEvent.js';
 import { GitIgnoreFilter } from '@gitlens/git/watching/gitIgnoreFilter.js';
+import { sanitizeIgnoredWorktreeFolders } from '@gitlens/git/watching/watcherPatterns.js';
+import { isCancellationError } from '@gitlens/utils/cancellation.js';
+import type { Event } from '@gitlens/utils/event.js';
+import { Emitter } from '@gitlens/utils/event.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
-import { joinPaths, maybeUri, normalizePath, splitPath } from '@gitlens/utils/path.js';
+import { joinPaths, maybeUri, normalizePath, splitPath, trimTrailingSlashes } from '@gitlens/utils/path.js';
+import { cancellable } from '@gitlens/utils/promise.js';
+import { iterateByDelimiter } from '@gitlens/utils/string.js';
 import type { Uri } from '@gitlens/utils/uri.js';
 import { fileUri, joinUriPath, parseUri, toFsPath } from '@gitlens/utils/uri.js';
+import { worktreeSharedChanges } from './exec/commandClassifier.js';
 import { fsExists } from './exec/exec.js';
 import type { FilteredGitFeatures, GitFeatureOrPrefix, GitFeatures } from './exec/features.js';
-import type { GitFeatureUnsupportedMessage, GitOptions } from './exec/git.js';
-import { Git } from './exec/git.js';
+import type { GitFeatureUnsupportedMessage, GitOptions, NamedRefs } from './exec/git.js';
+import { batchLiteralPathspecs, Git, gitConfigsStatus, GitError, GitErrors } from './exec/git.js';
+import { readCommonGitDir, readHeadState } from './exec/headState.js';
 import type { GitLocation } from './exec/locator.js';
+import { foldMatchingIgnored } from './parsers/statusParser.js';
 import { BlameGitSubProvider } from './providers/blame.js';
 import { BranchesGitSubProvider } from './providers/branches.js';
 import { CommitsGitSubProvider } from './providers/commits.js';
-import { ConfigGitSubProvider } from './providers/config.js';
+import { ConfigGitSubProvider, isGitBooleanFalse, parseGitBoolean } from './providers/config.js';
 import { ContributorsGitSubProvider } from './providers/contributors.js';
 import { DiffGitSubProvider } from './providers/diff.js';
 import { GraphGitSubProvider } from './providers/graph.js';
@@ -39,6 +56,9 @@ import { StashGitSubProvider } from './providers/stash.js';
 import { StatusGitSubProvider } from './providers/status.js';
 import { TagsGitSubProvider } from './providers/tags.js';
 import { WorktreesGitSubProvider } from './providers/worktrees.js';
+
+/** How long reading the folders whose worktrees are ignored may take before it counts as failed (a hung mount) */
+const ignoredWorktreeRootsTimeoutMs = 5000;
 
 export interface CliGitProviderOptions {
 	/** Use an existing Cache instance, or one will be created */
@@ -58,6 +78,15 @@ export interface CliGitProviderOptions {
 	 * failures rather than an honest "unsupported here". Defaults to `true`.
 	 */
 	localRepositories?: boolean;
+	/**
+	 * Folders, relative to a repository's common git dir, whose worktrees core acts as if didn't exist: they are left out
+	 * of worktree lists, and their add, remove, lock, unlock or move run through `notify: 'infer'`, and the watcher's
+	 * reports of their admin entries, raise no `worktrees` change. The typed worktree writes still announce one. A host
+	 * registers one for a tool's throwaway worktrees, which no host shows (sync-tools' `sync-tools-worktrees`, for one).
+	 * Nothing else is ignored, since a user may keep real worktrees anywhere, the git dir included. A folder that isn't
+	 * a literal path strictly inside the common git dir, or that lies under `worktrees`, is dropped.
+	 */
+	ignoredWorktreeFolders?: readonly string[];
 }
 
 /**
@@ -98,6 +127,9 @@ export class CliGitProvider implements GitProvider {
 	/** The host's own hooks, before the provider wraps `cache.onReset` with its own clearing */
 	private readonly _hostHooks: GitServiceContext['hooks'];
 	private readonly _localRepositories: boolean;
+	private readonly _ignoredWorktreeFolders: readonly string[];
+	/** By common git dir, the folders whose worktrees are ignored there: a common git dir never moves while it is open */
+	private readonly _ignoredWorktreeRoots = new Map<string, Promise<readonly string[]>>();
 
 	constructor(options: CliGitProviderOptions) {
 		// Every typed write announces itself through `onReset`, so the provider clears its own state there
@@ -114,13 +146,41 @@ export class CliGitProvider implements GitProvider {
 					...hostHooks?.cache,
 					onReset: (repoPath, ...types) => {
 						this._cache.evictCaches(repoPath, ...types);
-						this._git.clearPendingCommands(this.getRepositoryPaths(repoPath));
+						if (resetDropsPendingRuns(types)) {
+							this._git.clearPendingCommands(this.getRepositoryPaths(repoPath));
+						}
 						hostHooks?.cache?.onReset?.(repoPath, ...types);
+					},
+				},
+				repository: {
+					...hostHooks?.repository,
+					onChanged: (repoPath, changes, refs, options) => {
+						// Everything the watcher would have cleared for the write, since its own file events are
+						// dropped once it is announced (the typed write's `onReset` names only what it must evict)
+						this.resetForChanges(repoPath, changes, undefined);
+						// Worktrees share refs, tags, stash, remotes and config, so a typed write in one changes what
+						// its siblings show; the host hears the shared part of it for each, and they read fresh.
+						// Every path is reset before any is announced, so a read the host starts on hearing one path
+						// isn't evicted by the next path's reset
+						const siblings = this.getSiblingChanges(repoPath, changes);
+						for (const [path, shared] of siblings) {
+							this.resetForChanges(path, shared, undefined, true);
+						}
+
+						this.announceChanged(repoPath, changes, refs, options);
+						if (siblings.size === 0) return;
+
+						// Siblings share the one `.git/config`, so the write's config is as confined for them
+						const sharedRefs = refs?.length ? getSharedRefs(changes, refs) : undefined;
+						for (const [path, shared] of siblings) {
+							this.announceChanged(path, shared, sharedRefs, options);
+						}
 					},
 				},
 			},
 		};
 		this._localRepositories = options.localRepositories ?? true;
+		this._ignoredWorktreeFolders = sanitizeIgnoredWorktreeFolders(options.ignoredWorktreeFolders);
 		this._git =
 			options.git ??
 			new Git(options.locator, {
@@ -135,12 +195,90 @@ export class CliGitProvider implements GitProvider {
 
 		// Wires a raw `git.run({ notify })` call back to this provider's own cache/host announcement —
 		// unconditionally, so a host-supplied `options.git` gets bound exactly like one we construct here.
-		this._git.bindChangeNotifier((repoPaths, changes) => this.notifyChangedCore(repoPaths, changes));
+		this._git.bindChangeNotifier((repoPaths, changes, sharedPaths, named) =>
+			this.notifyChangedCore(repoPaths, changes, undefined, sharedPaths, named),
+		);
+		this._git.bindHeadReader(path => readHeadState(path, this.context.fs, this._cache));
+		// Bound even with no folder registered, so a `Git` shared with another provider never keeps that one's folders
+		this._git.bindIgnoredWorktreeRootsReader(path => this.getIgnoredWorktreeRoots(path));
 	}
 
 	/** The underlying cache instance (for repo path registration, etc.) */
 	get cache(): Cache {
 		return this._cache;
+	}
+
+	get onDidChangeMergeTargets(): Event<MergeTargetsChangeEvent> {
+		return this._cache.onDidChangeMergeTargets;
+	}
+
+	getIgnoredWorktreeFolders(_repoPath: string): readonly string[] {
+		return this._ignoredWorktreeFolders;
+	}
+
+	/**
+	 * `[]`, reading nothing, when no folder is registered. Read once per common git dir, since a worktree list rebuild
+	 * and every inferred worktree write ask for them; a read that fails or doesn't settle in time (a hung mount) rejects,
+	 * and isn't kept, so the next call reads again
+	 */
+	async getIgnoredWorktreeRoots(repoPath: string): Promise<readonly string[]> {
+		if (!this._ignoredWorktreeFolders.length) return [];
+
+		const commonGitDir = await cancellable(this.findCommonGitDir(repoPath), ignoredWorktreeRootsTimeoutMs);
+		let roots = this._ignoredWorktreeRoots.get(commonGitDir);
+		if (roots == null) {
+			const read = cancellable(this.readIgnoredWorktreeRoots(commonGitDir), ignoredWorktreeRootsTimeoutMs);
+			const entry = read.then(r => r.roots);
+			roots = entry;
+			this._ignoredWorktreeRoots.set(commonGitDir, entry);
+			const forget = () => {
+				if (this._ignoredWorktreeRoots.get(commonGitDir) === entry) {
+					this._ignoredWorktreeRoots.delete(commonGitDir);
+				}
+			};
+			// Roots missing the resolved spelling still serve this call, but a later one resolves again
+			void read.then(r => (r.resolved ? undefined : forget()), forget);
+		}
+		return roots;
+	}
+
+	/**
+	 * From the cached git dir, or the repository's own files, without running git; a repository whose files don't
+	 * show it (a bare one) runs git once, and the git dir it finds is cached with the repository
+	 */
+	private async findCommonGitDir(repoPath: string): Promise<string> {
+		const commonGitDir = await readCommonGitDir(repoPath, this.context.fs, this._cache);
+		if (commonGitDir != null) return commonGitDir;
+
+		const gitDir = await this.config.getGitDir(repoPath);
+		return (gitDir.commonUri ?? gitDir.uri).fsPath;
+	}
+
+	/** `resolved` is false when the common git dir's resolved spelling couldn't be read */
+	private async readIgnoredWorktreeRoots(
+		commonGitDir: string,
+	): Promise<{ readonly roots: readonly string[]; readonly resolved: boolean }> {
+		const roots = new Set(this._ignoredWorktreeFolders.map(f => normalizePath(joinPaths(commonGitDir, f))));
+		if (!this._localRepositories) return { roots: [...roots], resolved: true };
+
+		// Only the common git dir is resolved: a folder doesn't exist until its tool first makes a worktree there
+		const realCommonGitDir = await fs.realpath(commonGitDir).catch(() => undefined);
+		if (realCommonGitDir == null) return { roots: [...roots], resolved: false };
+
+		for (const folder of this._ignoredWorktreeFolders) {
+			roots.add(normalizePath(joinPaths(realCommonGitDir, folder)));
+		}
+		return { roots: [...roots], resolved: true };
+	}
+
+	getCommonPath(repoPath: string): string | undefined {
+		// An unregistered path is its own common path in the cache, which would hide a sibling worktree's writes
+		return this._cache.isRegistered(repoPath) ? this._cache.getCommonPath(repoPath) : undefined;
+	}
+
+	private readonly _onDidAnnounceChanges = new Emitter<AnnouncedRepositoryChanges>();
+	get onDidAnnounceChanges(): Event<AnnouncedRepositoryChanges> {
+		return this._onDidAnnounceChanges.event;
 	}
 
 	/** The underlying git execution instance (for sub-providers that need direct exec/stream access) */
@@ -251,19 +389,39 @@ export class CliGitProvider implements GitProvider {
 	 * for both its target and the caller's `cwd`. Each path's caches are reset and the host's `onReset` fires
 	 * for each, since a host may keep per-worktree state, but a repository's pending commands are dropped once
 	 * however many of its worktrees are named.
+	 *
+	 * Each path hears the announcement once: `repoPaths` hear all of `changes`, `sharedPaths` (reset and
+	 * `onReset`-ed like `repoPaths`) and then the other registered worktrees sharing a repository with any of
+	 * them (reset like a typed write's, with no `onReset`) hear the shared part of it, see
+	 * {@link getSiblingChanges}. `names.refs` reach `repoPaths` whole and the others as {@link getSharedRefs}.
 	 */
 	private notifyChangedCore(
 		repoPaths: readonly string[],
 		changes: readonly RepositoryChange[],
 		options?: { cache?: readonly CachedGitTypes[] | 'all' },
+		sharedPaths?: readonly string[],
+		names?: NamedRefs,
 	): void {
+		const announcements = new Map<string, readonly RepositoryChange[]>();
+		for (const repoPath of repoPaths) {
+			announcements.set(repoPath, [...changes]);
+		}
+		const shared = sharedPaths?.length ? this.getSharedChanges(changes) : undefined;
+		if (shared != null) {
+			for (const path of sharedPaths!) {
+				if (!announcements.has(path)) {
+					announcements.set(path, shared);
+				}
+			}
+		}
+
 		const resets: { repoPath: string; types: CachedGitTypes[] }[] = [];
 		const pendingPaths = new Set<string>();
-		for (const repoPath of repoPaths) {
-			const types = this.resetForChanges(repoPath, changes, options?.cache);
+		for (const [repoPath, announced] of announcements) {
+			const types = this.resetForChanges(repoPath, announced, options?.cache);
 			if (types == null) {
 				// A gk config change is reconciled outside the cache types, but its re-read must not join a pre-write run
-				if (options?.cache == null && changes.includes('gkConfig')) {
+				if (options?.cache == null && announced.includes('gkConfig')) {
 					for (const path of this.getRepositoryPaths(repoPath)) {
 						pendingPaths.add(path);
 					}
@@ -272,8 +430,21 @@ export class CliGitProvider implements GitProvider {
 			}
 
 			resets.push({ repoPath: repoPath, types: types });
-			for (const path of this.getRepositoryPaths(repoPath)) {
-				pendingPaths.add(path);
+			if (resetDropsPendingRuns(types)) {
+				for (const path of this.getRepositoryPaths(repoPath)) {
+					pendingPaths.add(path);
+				}
+			}
+		}
+
+		// The worktrees no one named: their shared refs, tags, stash, remotes and config just changed too
+		const named = [...announcements.keys()];
+		for (const repoPath of named) {
+			for (const [path, siblingChanges] of this.getSiblingChanges(repoPath, changes)) {
+				if (announcements.has(path)) continue;
+
+				announcements.set(path, siblingChanges);
+				this.resetForChanges(path, siblingChanges, options?.cache, true);
 			}
 		}
 
@@ -283,16 +454,100 @@ export class CliGitProvider implements GitProvider {
 		for (const { repoPath, types } of resets) {
 			this._hostHooks?.cache?.onReset?.(repoPath, ...types);
 		}
-		for (const repoPath of repoPaths) {
-			this.context.hooks?.repository?.onChanged?.(repoPath, [...changes]);
+		// The host's own hook: `context.hooks.repository.onChanged` also fans out to siblings, which would
+		// announce a path a second time
+		const sharedRefs = names?.refs.length ? getSharedRefs(changes, names.refs) : undefined;
+		for (const [path, announced] of announcements) {
+			this.announceChanged(path, [...announced], repoPaths.includes(path) ? names?.refs : sharedRefs, names);
 		}
 	}
 
-	/** Evicts what a notified change reset for `repoPath`: the types reset (`[]` = all), or `undefined` for none. */
+	/**
+	 * Tells only the host's own `repository.onChanged` about `changes` — for a follow-up that is not a write of
+	 * core's, such as re-announcing an outside change once it was reconciled. Nothing is evicted, no sibling hears
+	 * it, and the watch layer doesn't take it for a write's announcement.
+	 */
+	notifyHost(repoPath: string, changes: RepositoryChange[]): void {
+		this._hostHooks?.repository?.onChanged?.(repoPath, changes);
+	}
+
+	/**
+	 * Tells the host about a write for one path, after its caches were reset — the watch layer hears of it first.
+	 * `refs` are the full ref names the write moved, when it knows them, and `options.configConfinedToRefs` confines
+	 * its `config` change to the sections of the local branches among them (see `GitServiceHooks.repository.onChanged`);
+	 * the confinement is passed on only with `config` among `changes` and a branch in `refs` to confine it to.
+	 */
+	private announceChanged(
+		repoPath: string,
+		changes: RepositoryChange[],
+		refs?: readonly string[],
+		options?: { readonly configConfinedToRefs?: boolean },
+	): void {
+		if (refs?.length) {
+			if (
+				options?.configConfinedToRefs === true &&
+				changes.includes('config') &&
+				refs.some(r => r.startsWith('refs/heads/'))
+			) {
+				this._onDidAnnounceChanges.fire({
+					repoPath: repoPath,
+					changes: changes,
+					refs: refs,
+					configConfinedToRefs: true,
+				});
+				this._hostHooks?.repository?.onChanged?.(repoPath, changes, refs, { configConfinedToRefs: true });
+				return;
+			}
+
+			this._onDidAnnounceChanges.fire({ repoPath: repoPath, changes: changes, refs: refs });
+			this._hostHooks?.repository?.onChanged?.(repoPath, changes, refs);
+			return;
+		}
+
+		this._onDidAnnounceChanges.fire({ repoPath: repoPath, changes: changes });
+		this._hostHooks?.repository?.onChanged?.(repoPath, changes);
+	}
+
+	/**
+	 * What the worktrees sharing a repository hear of `changes` that ran in one of them: the part worktrees
+	 * share (see {@link worktreeSharedChanges}), or `undefined` when `changes` has none. An empty `changes` or
+	 * `'unknown'` means everything may have changed, so it reaches them as every shared kind — never as
+	 * `'unknown'` itself, which a host treats as the end of a watch session; `'closed'` concerns the one path
+	 * alone and reaches none.
+	 */
+	private getSharedChanges(changes: readonly RepositoryChange[]): RepositoryChange[] | undefined {
+		if (changes.includes('closed')) return undefined;
+		if (!changes.length || changes.includes('unknown')) return [...worktreeSharedChanges];
+
+		const shared = changes.filter(c => worktreeSharedChanges.has(c));
+		return shared.length ? shared : undefined;
+	}
+
+	/** What each registered worktree sharing `repoPath`'s repository, other than `repoPath`, hears of `changes`. */
+	private getSiblingChanges(repoPath: string, changes: readonly RepositoryChange[]): Map<string, RepositoryChange[]> {
+		const siblings = new Map<string, RepositoryChange[]>();
+		const shared = this.getSharedChanges(changes);
+		if (shared == null) return siblings;
+
+		const self = normalizePath(repoPath);
+		for (const path of this._cache.getWorktreePaths(this._cache.getCommonPath(repoPath))) {
+			if (path !== self) {
+				siblings.set(path, [...shared]);
+			}
+		}
+		return siblings;
+	}
+
+	/**
+	 * Evicts what a notified change reset for `repoPath`: the types reset (`[]` = all), or `undefined` for none.
+	 * A `sibling` shares its repository with a path already reset for the same change, which evicted the shared
+	 * entries for every worktree, so the changes evict only its own entries and advance its status clock.
+	 */
 	private resetForChanges(
 		repoPath: string,
 		changes: readonly RepositoryChange[],
 		cache: readonly CachedGitTypes[] | 'all' | undefined,
+		sibling: boolean = false,
 	): CachedGitTypes[] | undefined {
 		if (cache != null && cache !== 'all') {
 			if (!cache.length) return undefined;
@@ -306,7 +561,12 @@ export class CliGitProvider implements GitProvider {
 			return [];
 		}
 
-		const types = this._cache.applyRepositoryChanges(repoPath, changes, 'evict');
+		const types = this._cache.applyRepositoryChanges(
+			repoPath,
+			changes,
+			'evict',
+			sibling ? { worktreeOnly: true } : undefined,
+		);
 		return types.length ? types : undefined;
 	}
 
@@ -507,6 +767,7 @@ export class CliGitProvider implements GitProvider {
 			this._git,
 			this._cache,
 			this as unknown as CliGitProviderInternal,
+			this._ignoredWorktreeFolders.length ? path => this.getIgnoredWorktreeRoots(path) : undefined,
 		));
 	}
 
@@ -565,14 +826,353 @@ export class CliGitProvider implements GitProvider {
 				repoPath: repoPath,
 				gitDirPath: gitDirPath,
 				fs: this.context.fs,
-				getGlobalExcludesPath:
-					this.config.getConfig != null
-						? async () => this.config.getConfig(repoPath, 'core.excludesFile')
-						: undefined,
+				// Resolved the way git resolves it; unset, git reads its default location instead
+				getGlobalExcludesPath: async () => {
+					const { excludesFile: configured } = await this.config.getIgnoreConfig(repoPath);
+					return configured != null
+						? resolveGitPathConfig(configured, repoPath)
+						: getDefaultGlobalExcludesPath();
+				},
+				// `info/exclude` lives in the COMMON git dir — a linked worktree's own git dir has none
+				getInfoExcludePath: async () => {
+					const gitDir = await this.config.getGitDir?.(repoPath);
+					if (gitDir == null) return undefined;
+
+					return `${(gitDir.commonUri ?? gitDir.uri).fsPath}/info/exclude`;
+				},
+				getGitIgnorePaths: () => this.getGitIgnorePaths(repoPath),
+				getIgnoreCase: async () => {
+					const { ignoreCase: value } = await this.config.getIgnoreConfig(repoPath);
+					if (value == null) return undefined;
+					if (parseGitBoolean(value)) return true;
+
+					return isGitBooleanFalse(value) ? false : undefined;
+				},
 			});
 			this._cache.gitIgnore.set(repoPath, filter);
 		}
 		return filter;
+	}
+
+	async getIgnoredDirectories(repoPath: string, cancellation?: AbortSignal): Promise<string[]> {
+		// `--directory` collapses a directory to one entry when everything in it is ignored — which includes
+		// directories no rule matches whose current contents merely happen to be ignored (a `logs/` holding only
+		// `*.log` files under a `*.log` rule), so each candidate is confirmed against the rules below
+		const listed = await this._git.run(
+			{ cwd: repoPath, errors: 'throw', cancellation: cancellation },
+			'ls-files',
+			'-z',
+			'--others',
+			'--ignored',
+			'--exclude-standard',
+			'--directory',
+		);
+
+		const candidates: string[] = [];
+		for (const entry of iterateByDelimiter(listed.stdout, '\0')) {
+			if (entry.length > 1 && entry.endsWith('/')) {
+				candidates.push(entry);
+			}
+		}
+		if (!candidates.length) return [];
+
+		const confirmed = await this.getIgnoredPaths(repoPath, candidates, undefined, cancellation);
+
+		const directories: string[] = [];
+		for (const entry of confirmed) {
+			// Never `.git` itself, and no name a watcher would read as a pattern
+			if (entry.length < 2 || !entry.endsWith('/') || /[*?[\]{}()!+@\\]/.test(entry)) continue;
+
+			const directory = entry.substring(0, entry.length - 1);
+			if (directory === '.git') continue;
+
+			directories.push(directory);
+		}
+
+		// A path sorts after every prefix of it, so an entry's ancestors have already been kept (or not) by the time it
+		// is checked — and the kept set comes out sorted
+		directories.sort();
+
+		const kept = new Set<string>();
+		for (const directory of directories) {
+			let beneathKept = false;
+			for (let i = directory.indexOf('/'); i !== -1; i = directory.indexOf('/', i + 1)) {
+				if (kept.has(directory.substring(0, i))) {
+					beneathKept = true;
+					break;
+				}
+			}
+			if (!beneathKept) {
+				kept.add(directory);
+			}
+		}
+
+		return [...kept];
+	}
+
+	async getIgnoredEntries(
+		repoPath: string,
+		options?: { paths?: readonly string[]; priority?: GitCommandPriority },
+		cancellation?: AbortSignal,
+	): Promise<string[]> {
+		let paths = options?.paths;
+		// No pathspec means "everything" to git, which is not what an empty list asks for
+		if (paths != null && !paths.length) return [];
+
+		// A scope inside an ignored folder makes git list the folder itself, or fail outright, so a scope that is
+		// itself ignored is answered here, as one entry, and left out of the listing
+		const scopedEntries = new Set<string>();
+		if (paths != null) {
+			const scopes = [...new Set(paths.map(p => (p.length > 1 ? trimTrailingSlashes(p) : p)))];
+			const ignoredScopes = await this.getIgnoredScopes(
+				repoPath,
+				scopes.filter(p => p !== ''),
+				options?.priority,
+				cancellation,
+			);
+
+			const ignored = [...ignoredScopes];
+			// `lstat`, as git lists a symlink as a file even when it points at a folder
+			const listed = await Promise.allSettled(
+				ignored.map(async scope => {
+					const fullPath = path.join(repoPath, scope);
+					if (!(await fs.lstat(fullPath)).isDirectory()) return scope;
+
+					return (await hasNonDirectoryEntry(fullPath)) ? `${scope}/` : undefined;
+				}),
+			);
+			for (const result of listed) {
+				// Not on disk, so nothing is ignored there
+				if (result.status === 'fulfilled' && result.value != null) {
+					scopedEntries.add(result.value);
+				}
+			}
+
+			paths = scopes.filter(p => !ignoredScopes.has(p));
+			if (!paths.length) return [...scopedEntries].sort();
+		}
+
+		// `status --ignored` walks every ignored tree, and `ls-files --directory` drops the ignored entries inside a
+		// new untracked folder, so status is asked only about those folders
+		const args = ['ls-files', '-z', '--others', '--exclude-standard', '--directory', '--no-empty-directory'];
+		const runOptions = {
+			cwd: repoPath,
+			errors: 'throw',
+			cancellation: cancellation,
+			priority: options?.priority,
+		} as const;
+
+		const readListing = async (extra: readonly string[]): Promise<Set<string>> => {
+			const listed = new Set<string>();
+			const prefix = [...args, ...extra];
+			for (const batch of paths != null ? batchLiteralPathspecs(paths, prefix) : [undefined]) {
+				const result = await this._git.run(runOptions, ...prefix, ...(batch != null ? ['--', ...batch] : []));
+				for (const entry of iterateByDelimiter(result.stdout, '\0')) {
+					if (entry !== '') {
+						listed.add(entry);
+					}
+				}
+			}
+			return listed;
+		};
+
+		const [ignoredResult, untrackedResult] = await Promise.allSettled([
+			readListing(['--ignored']),
+			readListing([]),
+		]);
+		if (ignoredResult.status === 'rejected') throw ignoredResult.reason;
+		if (untrackedResult.status === 'rejected') throw untrackedResult.reason;
+
+		const entries = new Set<string>(scopedEntries);
+		for (const entry of ignoredResult.value) {
+			if (entry !== '.git/') {
+				entries.add(entry);
+			}
+		}
+
+		const folders: string[] = [];
+		for (const entry of untrackedResult.value) {
+			if (entry.endsWith('/')) {
+				folders.push(entry);
+			}
+		}
+		if (!folders.length) return [...entries].sort();
+
+		// `matching` reports a folder an ignore rule matches without walking it, but lists each file of a folder that is
+		// ignored only because all of its files are, so `all` untracked files are needed to fold those back
+		const matching = await this._git.supports('git:status:ignored-matching');
+		const prefix = [
+			'status',
+			'--porcelain',
+			'-z',
+			matching ? '--ignored=matching' : '--ignored',
+			matching ? '--untracked-files=all' : '--untracked-files=normal',
+			'--ignore-submodules=all',
+		];
+
+		const records: string[] = [];
+		for (const batch of batchLiteralPathspecs(folders, prefix)) {
+			const listed = await this._git.run(
+				{
+					...runOptions,
+					configs: [...gitConfigsStatus, '-c', 'status.renames=false'],
+					env: { GIT_OPTIONAL_LOCKS: '0' },
+				},
+				...prefix,
+				'--',
+				...batch,
+			);
+
+			// Only untracked folders are in scope, so there are no tracked entries, and no rename pairs, to step over
+			for (const record of iterateByDelimiter(listed.stdout, '\0')) {
+				if (matching) {
+					records.push(record);
+				} else if (record.startsWith('!! ')) {
+					entries.add(record.substring(3));
+				}
+			}
+		}
+
+		if (matching) {
+			for (const entry of foldMatchingIgnored(records)) {
+				entries.add(entry);
+			}
+		}
+		return [...entries].sort();
+	}
+
+	/**
+	 * Which of `scopes` are ignored. A scope git refuses (beyond a symlink, inside a submodule) is not ignored, as the
+	 * listing answers it with nothing. Any other failure answers none; when git itself is failing, the listing that
+	 * follows fails too.
+	 */
+	private async getIgnoredScopes(
+		repoPath: string,
+		scopes: readonly string[],
+		priority: GitCommandPriority | undefined,
+		cancellation: AbortSignal | undefined,
+	): Promise<Set<string>> {
+		try {
+			return await this.getIgnoredPaths(repoPath, scopes, { priority: priority }, cancellation);
+		} catch (ex) {
+			if (isCancellationError(ex)) throw ex;
+
+			return new Set();
+		}
+	}
+
+	/**
+	 * `check-ignore` dies on the first path it can't answer (inside a submodule, beyond a symlink, outside the repository,
+	 * or empty), where this repository ignores nothing, having answered every path before it, so the paths after it are
+	 * asked again, less those in the folder of a path refused for a symlink or submodule, which share its fate. Each path
+	 * is answered once, in one run plus one for each refusal. Any other failure is thrown.
+	 */
+	async getIgnoredPaths(
+		repoPath: string,
+		paths: readonly string[],
+		options?: { priority?: GitCommandPriority },
+		cancellation?: AbortSignal,
+	): Promise<Set<string>> {
+		const ignored = new Set<string>();
+		let pending = paths;
+		while (pending.length) {
+			const refused = await this.checkIgnore(repoPath, pending, ignored, options, cancellation);
+			if (refused == null) break;
+
+			const folder = refused.folderWide ? getRefusedFolder(pending[refused.index]) : undefined;
+			pending = pending.slice(refused.index + 1);
+			if (folder != null) {
+				pending = pending.filter(p => !p.startsWith(folder) || hasDotSegment(p));
+			}
+		}
+		return ignored;
+	}
+
+	/**
+	 * One `check-ignore` run over `paths`, adding the ignored ones to `ignored`. Returns the path git died on, which
+	 * every path before it was answered ahead of, or `undefined` when all were answered.
+	 */
+	private async checkIgnore(
+		repoPath: string,
+		paths: readonly string[],
+		ignored: Set<string>,
+		options: { priority?: GitCommandPriority } | undefined,
+		cancellation: AbortSignal | undefined,
+	): Promise<{ index: number; folderWide: boolean } | undefined> {
+		// check-ignore reads each line as a pathspec, so a leading `:` would be parsed as magic; `./` makes it a literal path
+		const lines = paths.map(p => (p.startsWith(':') ? `./${p}` : p));
+
+		let stdout: string;
+		let refusal: GitError | undefined;
+		try {
+			// `-v -n` writes a record for every path answered, so the records line up with `paths` and end where git died
+			const result = await this._git.run(
+				{
+					cwd: repoPath,
+					errors: 'throw',
+					cancellation: cancellation,
+					priority: options?.priority,
+					stdin: `${lines.join('\0')}\0`,
+					expectedExitCodes: [1],
+				},
+				'check-ignore',
+				'-v',
+				'-n',
+				'-z',
+				'--stdin',
+			);
+			stdout = result.stdout;
+		} catch (ex) {
+			if (!(ex instanceof GitError) || ex.stderr == null || !GitErrors.pathspecRefused.test(ex.stderr)) throw ex;
+
+			refusal = ex;
+			stdout = ex.stdout ?? '';
+		}
+
+		// Each record is source, line number, pattern and path; the pattern is empty when none matched, and `!`-prefixed
+		// when it re-includes the path
+		let index = 0;
+		let field = 0;
+		let matched = false;
+		for (const value of iterateByDelimiter(stdout, '\0')) {
+			if (field === 2) {
+				matched = value.length > 0 && !value.startsWith('!');
+			} else if (field === 3) {
+				if (matched && index < paths.length) {
+					ignored.add(paths[index]);
+				}
+				index++;
+			}
+			field = (field + 1) % 4;
+		}
+
+		if (refusal == null) return undefined;
+		// Every path answered yet git still died, so the refusal can't be pinned to one of them
+		if (index >= paths.length) throw refusal;
+
+		return { index: index, folderWide: /is (?:beyond a symbolic link|in submodule)/i.test(refusal.stderr ?? '') };
+	}
+
+	/** Every `.gitignore` git reads in the working tree (tracked, or untracked and not itself ignored), root included */
+	private async getGitIgnorePaths(repoPath: string): Promise<string[]> {
+		const result = await this._git.run(
+			{ cwd: repoPath, errors: 'throw' },
+			'ls-files',
+			'-z',
+			'--cached',
+			'--others',
+			'--exclude-standard',
+			'--',
+			':(glob)**/.gitignore',
+		);
+
+		const paths: string[] = [];
+		for (const line of iterateByDelimiter(result.stdout, '\0')) {
+			if (!line.length) continue;
+
+			paths.push(line);
+		}
+		return paths;
 	}
 
 	private async isTrackedWithDetails(
@@ -608,9 +1208,80 @@ export class CliGitProvider implements GitProvider {
 	}
 
 	dispose(): void {
+		this._onDidAnnounceChanges.dispose();
 		this._git.dispose();
 		if (this._cacheOwned) {
 			this._cache.dispose();
 		}
 	}
+}
+
+/**
+ * The names in `refs` a sibling worktree hears with the shared part of `changes`: those of a shared ref kind among
+ * `changes`. An empty `changes` or `'unknown'` reaches siblings as every shared kind, unnamed, so none.
+ */
+function getSharedRefs(changes: readonly RepositoryChange[], refs: readonly string[]): string[] | undefined {
+	if (!changes.length || changes.includes('unknown')) return undefined;
+
+	const shared = refs.filter(r => {
+		if (!r.startsWith('refs/')) return false;
+
+		const kind = getRefChangeKind(r);
+		return kind != null && changes.includes(kind) && worktreeSharedChanges.has(kind);
+	});
+	return shared.length ? shared : undefined;
+}
+
+/**
+ * Resolves a pathname config value the way git does: a leading `~/` (or a bare `~`) is the home directory, and a
+ * relative path is taken from the repository root. Done here rather than with `git config --type=path`, which needs
+ * git 2.18, newer than the minimum supported version.
+ */
+function resolveGitPathConfig(value: string, repoPath: string): string {
+	if (value === '~' || value.startsWith('~/')) {
+		return path.join(env.HOME || homedir(), value.substring(1));
+	}
+
+	return path.resolve(repoPath, value);
+}
+
+/** Where git reads global excludes when `core.excludesFile` is unset: `$XDG_CONFIG_HOME/git/ignore`, else `$HOME/.config/git/ignore` */
+function getDefaultGlobalExcludesPath(): string | undefined {
+	const xdgConfigHome = env.XDG_CONFIG_HOME;
+	if (xdgConfigHome) return path.join(xdgConfigHome, 'git', 'ignore');
+
+	const home = env.HOME || homedir();
+	return home ? path.join(home, '.config', 'git', 'ignore') : undefined;
+}
+
+/**
+ * The folder of a path git refused for a symlink or submodule in its leading folders, where every other path is refused
+ * too; none for a top-level path, or one with `.` or `..` segments, whose folder git would read otherwise
+ */
+function getRefusedFolder(refused: string): string | undefined {
+	const trimmed = trimTrailingSlashes(refused);
+	if (hasDotSegment(trimmed)) return undefined;
+
+	const index = trimmed.lastIndexOf('/');
+	return index > 0 ? trimmed.substring(0, index + 1) : undefined;
+}
+
+function hasDotSegment(p: string): boolean {
+	return /(?:^|\/)\.\.?(?:\/|$)/.test(p);
+}
+
+/** Whether a folder holds a file or symlink anywhere below it, as git lists no folder without one; an unreadable folder holds none */
+async function hasNonDirectoryEntry(folder: string): Promise<boolean> {
+	const pending = [folder];
+	while (pending.length) {
+		const current = pending.pop()!;
+		try {
+			for (const entry of await fs.readdir(current, { withFileTypes: true })) {
+				if (!entry.isDirectory()) return true;
+
+				pending.push(path.join(current, entry.name));
+			}
+		} catch {}
+	}
+	return false;
 }

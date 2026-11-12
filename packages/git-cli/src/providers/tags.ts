@@ -25,7 +25,7 @@ export class TagsGitSubProvider implements GitTagsSubProvider {
 		private readonly provider: CliGitProviderInternal,
 	) {}
 
-	@debug()
+	@debug({ quiet: true })
 	async getTag(repoPath: string, name: string, cancellation?: AbortSignal): Promise<GitTag | undefined> {
 		const {
 			values: [tag],
@@ -33,7 +33,7 @@ export class TagsGitSubProvider implements GitTagsSubProvider {
 		return tag;
 	}
 
-	@debug({ args: repoPath => ({ repoPath: repoPath }) })
+	@debug({ quiet: true, args: repoPath => ({ repoPath: repoPath }) })
 	async getTags(
 		repoPath: string,
 		options?: {
@@ -109,7 +109,7 @@ export class TagsGitSubProvider implements GitTagsSubProvider {
 		return tagsResult;
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async getTagsWithCommit(
 		repoPath: string,
 		sha: string,
@@ -151,8 +151,6 @@ export class TagsGitSubProvider implements GitTagsSubProvider {
 
 		try {
 			await this.git.run({ cwd: repoPath }, ...args);
-			this.context.hooks?.cache?.onReset?.(repoPath, 'tags');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['tags']);
 		} catch (ex) {
 			throw getGitCommandError(
 				'tag',
@@ -163,6 +161,9 @@ export class TagsGitSubProvider implements GitTagsSubProvider {
 						ex as GitError,
 					),
 			);
+		} finally {
+			this.context.hooks?.cache?.onReset?.(repoPath, 'tags');
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['tags']);
 		}
 	}
 
@@ -172,8 +173,6 @@ export class TagsGitSubProvider implements GitTagsSubProvider {
 
 		try {
 			await this.git.run({ cwd: repoPath }, ...args);
-			this.context.hooks?.cache?.onReset?.(repoPath, 'tags');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['tags']);
 		} catch (ex) {
 			throw getGitCommandError(
 				'tag',
@@ -184,6 +183,9 @@ export class TagsGitSubProvider implements GitTagsSubProvider {
 						ex as GitError,
 					),
 			);
+		} finally {
+			this.context.hooks?.cache?.onReset?.(repoPath, 'tags');
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['tags']);
 		}
 	}
 

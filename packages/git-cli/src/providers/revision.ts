@@ -12,16 +12,24 @@ import {
 	isUncommittedStaged,
 	isUncommittedWithParentSuffix,
 } from '@gitlens/git/utils/revision.utils.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
 import { gate } from '@gitlens/utils/decorators/gate.js';
 import { debug } from '@gitlens/utils/decorators/log.js';
 import { first } from '@gitlens/utils/iterable.js';
-import { splitPath } from '@gitlens/utils/path.js';
+import { joinPaths, splitPath } from '@gitlens/utils/path.js';
+import { iterateByDelimiter } from '@gitlens/utils/string.js';
 import type { Uri } from '@gitlens/utils/uri.js';
 import { toFsPath } from '@gitlens/utils/uri.js';
 import type { CliGitProviderInternal } from '../cliGitProvider.js';
 import type { GitErrorHandling, GitRunOptions } from '../exec/exec.types.js';
 import type { Git } from '../exec/git.js';
-import { defaultExceptionHandler, getGitCommandError, gitConfigsLog, GitErrors } from '../exec/git.js';
+import {
+	batchLiteralPathspecs,
+	defaultExceptionHandler,
+	getGitCommandError,
+	gitConfigsLog,
+	GitErrors,
+} from '../exec/git.js';
 import { parseGitLsFilesStaged } from '../parsers/indexParser.js';
 import { getShaAndFileSummaryLogParser } from '../parsers/logParser.js';
 import { parseGitTree } from '../parsers/treeParser.js';
@@ -65,13 +73,110 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 				args.push('-c', '-o');
 			}
 
-			const result = await this.git.run({ cwd: repoPath, errors: 'ignore' }, ...args, '--', path);
+			// Literal, or a missing `[id]/page.tsx` would count as existing whenever `i/page.tsx` does
+			const result = await this.git.run({ cwd: repoPath, errors: 'ignore' }, ...args, '--', `:(literal)${path}`);
 			return Boolean(result.stdout.trim());
 		});
 	}
 
-	/** `hash-object` without `-w` computes the id in the repository's format without storing anything */
 	@debug()
+	async getBlobIds(
+		repoPath: string,
+		paths: readonly string[],
+		source: 'index' | 'working',
+		cancellation?: AbortSignal,
+	): Promise<Map<string, string>> {
+		const ids = new Map<string, string>();
+		if (paths.length === 0) return ids;
+
+		if (source === 'index') {
+			// Literal pathspecs, so a file named like `[id]/page.tsx` doesn't also match `i/page.tsx`
+			const prefix = ['ls-files', '-z', '--stage'];
+			for (const batch of batchLiteralPathspecs(paths, prefix)) {
+				const result = await this.git.run(
+					{ cwd: repoPath, cancellation: cancellation, errors: 'ignore' },
+					...prefix,
+					'--',
+					...batch,
+				);
+				for (const entry of parseGitLsFilesStaged(result.stdout, false)) {
+					// A conflicted path lists one entry per stage; the first is as good an identity as any
+					if (!ids.has(entry.path)) {
+						ids.set(entry.path, entry.oid);
+					}
+				}
+			}
+			return ids;
+		}
+
+		// `hash-object` without `-w` computes ids without storing anything; `--stdin-paths` hashes them
+		// all in one process, printing one line per path in input order. A path it can't hash (a
+		// submodule, a directory, a missing or unreadable file) ends the run right there, after the ids
+		// of the paths before it — so the first missing line names the culprit, and the rest resume in
+		// a new run after it.
+		const unhashable: string[] = [];
+		let start = 0;
+		while (start < paths.length) {
+			const pending = paths.slice(start);
+			const result = await this.git.run(
+				{ cwd: repoPath, cancellation: cancellation, errors: 'ignore', stdin: `${pending.join('\n')}\n` },
+				'hash-object',
+				'--stdin-paths',
+			);
+			const lines = result.stdout.split('\n');
+			let hashed = 0;
+			while (hashed < pending.length) {
+				const oid = lines[hashed]?.trim();
+				if (!oid) break;
+
+				ids.set(pending[hashed], oid);
+				hashed++;
+			}
+			if (hashed === pending.length) break;
+			// Only a run that exited with an error stopped at a path; a cancelled or never-started one
+			// says nothing about which path is to blame
+			if (result.completion.status !== 'exited' || result.completion.code === 0) break;
+
+			unhashable.push(pending[hashed]);
+			start += hashed + 1;
+		}
+
+		if (unhashable.length && !cancellation?.aborted) {
+			await Promise.all(
+				unhashable.map(async path => {
+					const oid = await this.getCheckedOutSubmoduleCommit(repoPath, path, cancellation);
+					if (oid) {
+						ids.set(path, oid);
+					}
+				}),
+			);
+		}
+		return ids;
+	}
+
+	/** The commit checked out in the submodule at `path` — what the index records for it too, so its id
+	 *  moves when the submodule does. Anything else that couldn't be hashed has no id. */
+	private async getCheckedOutSubmoduleCommit(
+		repoPath: string,
+		path: string,
+		cancellation: AbortSignal | undefined,
+	): Promise<string | undefined> {
+		// Inside a plain directory git finds the outer repository and reports a non-empty prefix (`dir/`);
+		// only the top of a repository of its own answers with an empty one
+		const result = await this.git.run(
+			{ cwd: joinPaths(repoPath, path), cancellation: cancellation, errors: 'ignore' },
+			'rev-parse',
+			'--show-prefix',
+			'HEAD',
+		);
+		if (result.completion.status !== 'exited' || result.completion.code !== 0) return undefined;
+
+		const [prefix, sha] = result.stdout.split('\n');
+		return prefix === '' ? sha?.trim() || undefined : undefined;
+	}
+
+	/** `hash-object` without `-w` computes the id in the repository's format without storing anything */
+	@debug({ quiet: true })
 	getEmptyTreeSha(repoPath: string): Promise<string> {
 		return this.cache.getEmptyTreeSha(repoPath, async () => {
 			const result = await this.git.run(
@@ -86,13 +191,13 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 	}
 
 	@gate()
-	@debug()
+	@debug({ quiet: true })
 	getRevisionContent(repoPath: string, path: string, rev: string): Promise<Uint8Array | undefined> {
 		const [relativePath, root] = splitPath(path, repoPath);
 		return this.showContentCore<Buffer>(root, relativePath, rev, { encoding: 'buffer', errors: 'throw' });
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async getSubmoduleHead(repoPath: string, submodulePath: string): Promise<string | undefined> {
 		// Verify the path is a submodule (gitlink commit) in the parent tree, not just a regular directory
 		const treeEntry = await this.getTreeEntryForRevision(repoPath, submodulePath, 'HEAD');
@@ -107,7 +212,7 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 	}
 
 	@gate()
-	@debug()
+	@debug({ quiet: true })
 	async getTreeEntryForRevision(repoPath: string, path: string, rev: string): Promise<GitTreeEntry | undefined> {
 		if (!repoPath || !path) return undefined;
 
@@ -120,7 +225,8 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 				'-z',
 				'--stage',
 				'--',
-				relativePath,
+				// Literal, or a glob-like name could read the entry of a different file that it matches
+				`:(literal)${relativePath}`,
 			);
 
 			const entries = parseGitLsFilesStaged(result.stdout, true);
@@ -137,27 +243,112 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 		return entry;
 	}
 
-	@debug()
-	async getTrackedFiles(repoPath: string): Promise<string[]> {
+	@debug({ quiet: true })
+	async getTrackedFiles(
+		repoPath: string,
+		options?: { paths?: readonly string[] },
+		cancellation?: AbortSignal,
+	): Promise<string[]> {
 		if (!repoPath) return [];
 
-		const result = await this.git.run({ cwd: repoPath, errors: 'ignore' }, 'ls-files', '-z');
-		const data = result.stdout;
-		if (!data) return [];
+		const paths = options?.paths;
+		// No pathspec means "everything" to git, which is not what an empty list asks for
+		if (paths != null && !paths.length) return [];
 
-		return [...new Set(data.split('\0').filter(Boolean))];
+		const prefix = ['ls-files', '-z'];
+		// A single run when unscoped, otherwise batched to stay under the command-line length limit
+		const batches = paths != null ? batchLiteralPathspecs(paths, prefix) : [undefined];
+
+		// Unmerged entries are listed once per stage, and a path can sit under more than one scope
+		const files = new Set<string>();
+		for (const batch of batches) {
+			const result = await this.git.run(
+				{ cwd: repoPath, errors: 'ignore', cancellation: cancellation },
+				...prefix,
+				...(batch != null ? ['--', ...batch] : []),
+			);
+			// `errors: 'ignore'` resolves an abort as an empty listing, which would read as a folder with no files
+			if (result.completion.status === 'cancelled' || cancellation?.aborted) throw new CancellationError();
+
+			for (const file of iterateByDelimiter(result.stdout, '\0')) {
+				if (file) {
+					files.add(file);
+				}
+			}
+		}
+		return [...files];
 	}
 
-	@debug()
-	async getTreeForRevision(repoPath: string, rev: string): Promise<GitTreeEntry[]> {
-		return repoPath ? this.getTreeForRevisionCore(repoPath, rev) : [];
+	@debug({ quiet: true })
+	async getTreeForRevision(
+		repoPath: string,
+		rev: string,
+		options?: { paths?: readonly string[] },
+		cancellation?: AbortSignal,
+	): Promise<GitTreeEntry[]> {
+		if (!repoPath) return [];
+
+		const paths = options?.paths;
+		if (paths == null) return this.getTreeForRevisionCore(repoPath, rev, undefined, undefined, cancellation);
+		// No pathspec means "everything" to git, which is not what an empty list asks for
+		if (!paths.length) return [];
+
+		// A scope's ancestor folders are listed with it, and a path can sit under more than one scope
+		const seen = new Set<string>();
+		const entries: GitTreeEntry[] = [];
+		for (const batch of batchLiteralPathspecs(paths, ['ls-tree', '-lrt', rev])) {
+			for (const entry of await this.getTreeForRevisionCore(repoPath, rev, undefined, batch, cancellation)) {
+				if (!seen.has(entry.path)) {
+					seen.add(entry.path);
+					entries.push(entry);
+				}
+			}
+		}
+		return entries;
+	}
+
+	/**
+	 * A read with a signal skips the gate, whose default key can't tell signals apart (one caller's abort would cancel
+	 * another's read) and which keeps an instance property per key for good (a key per signal would grow without end).
+	 * `git.run` still joins such a read to an identical one with the same signal
+	 */
+	private getTreeForRevisionCore(
+		repoPath: string,
+		rev: string,
+		path?: string,
+		pathspecs?: readonly string[],
+		cancellation?: AbortSignal,
+	): Promise<GitTreeEntry[]> {
+		return cancellation != null
+			? this.lsTree(repoPath, rev, path, pathspecs, cancellation)
+			: this.getTreeForRevisionGated(repoPath, rev, path, pathspecs);
 	}
 
 	@gate()
-	private async getTreeForRevisionCore(repoPath: string, rev: string, path?: string): Promise<GitTreeEntry[]> {
+	private getTreeForRevisionGated(
+		repoPath: string,
+		rev: string,
+		path?: string,
+		pathspecs?: readonly string[],
+	): Promise<GitTreeEntry[]> {
+		return this.lsTree(repoPath, rev, path, pathspecs);
+	}
+
+	private async lsTree(
+		repoPath: string,
+		rev: string,
+		path?: string,
+		pathspecs?: readonly string[],
+		cancellation?: AbortSignal,
+	): Promise<GitTreeEntry[]> {
 		const hasPath = Boolean(path);
-		const args = hasPath ? ['ls-tree', '-l', rev, '--', path] : ['ls-tree', '-lrt', rev, '--'];
-		const result = await this.git.run({ cwd: repoPath, errors: 'ignore' }, ...args);
+		const args = hasPath
+			? ['ls-tree', '-l', rev, '--', path]
+			: ['ls-tree', '-lrt', rev, '--', ...(pathspecs ?? [])];
+		const result = await this.git.run({ cwd: repoPath, errors: 'ignore', cancellation: cancellation }, ...args);
+		// `errors: 'ignore'` resolves an abort as an empty tree, which would read as a folder with no entries
+		if (result.completion.status === 'cancelled' || cancellation?.aborted) throw new CancellationError();
+
 		const data = result.stdout.trim();
 		if (!data) return emptyArray as GitTreeEntry[];
 
@@ -228,7 +419,7 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 		}
 	}
 
-	@debug({ args: (repoPath, shas) => ({ repoPath: repoPath, shas: `${shas.size} value(s)` }) })
+	@debug({ quiet: true, args: (repoPath, shas) => ({ repoPath: repoPath, shas: `${shas.size} value(s)` }) })
 	async resolveShas(repoPath: string, shas: ReadonlySet<string>, cancellation?: AbortSignal): Promise<Set<string>> {
 		const resolved = new Set<string>();
 		const prefixes: string[] = [];
@@ -270,7 +461,7 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 		return resolved;
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async resolveRevision(
 		repoPath: string,
 		ref: string,

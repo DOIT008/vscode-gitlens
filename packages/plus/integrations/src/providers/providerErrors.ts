@@ -1,13 +1,18 @@
+import { Logger } from '@gitlens/utils/logger.js';
 import type { TokenWithInfo } from '../authentication/models.js';
 import type { IntegrationIds } from '../constants.js';
 import {
 	GitCloudHostIntegrationId,
 	GitSelfManagedHostIntegrationId,
 	IssuesCloudHostIntegrationId,
+	IssuesSelfManagedHostIntegrationId,
 } from '../constants.js';
+import type { ResponseHeaders } from '../errors.js';
 import {
 	AuthenticationError,
 	AuthenticationErrorReason,
+	getAuthenticatedUser,
+	isProviderUnreachableError,
 	isRateLimitResponse,
 	RequestClientError,
 	RequestNotFoundError,
@@ -42,6 +47,80 @@ export class UnexpectedHtmlResponseError extends Error {
 
 	constructor(status: number, contentType: string, response: ProviderErrorResponse | undefined) {
 		super(`(${status}) Expected data but the provider returned an HTML page (content-type: ${contentType})`);
+
+		this.response = sanitizeErrorResponse(status, response);
+
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+/**
+ * A provider read that failed on the data a request returned rather than on the request: `provider-apis` reads a
+ * response body as the shape it expects without checking it, so a 2xx carrying anything else (a gateway's JSON
+ * error, `{}`, `null`, a GraphQL answer with neither data nor errors) surfaces as a `TypeError` thrown deep inside the
+ * read, such as `response.body.map is not a function` from Jira Cloud's site list or Trello's boards, or
+ * `Cannot read properties of undefined (reading 'id')` from Linear's organization. See {@link throwProviderError}.
+ *
+ * The message is the readable one a warning carries. The `TypeError` is kept as `original`, and a log line, which
+ * prints the error through `toString()`, names it too.
+ */
+export class UnexpectedResponseError extends Error {
+	static is(ex: unknown): ex is UnexpectedResponseError {
+		return ex instanceof UnexpectedResponseError;
+	}
+
+	constructor(readonly original: Error) {
+		super('Expected data but the provider returned an unexpected response');
+
+		Error.captureStackTrace?.(this, new.target);
+	}
+
+	override toString(): string {
+		return `${super.toString()} (${String(this.original)})`;
+	}
+}
+
+/** What the request function `ProvidersApi` hands `provider-apis` threw itself: see {@link markRequestError}. */
+const requestErrors = new WeakMap<object, { path: string; method: string } | undefined>();
+
+/**
+ * Records an error the request function threw itself (a transport failure, or a response it refused), so
+ * {@link throwProviderError} never reads it as data a read could not handle, whatever the host's fetch throws.
+ * Returns `ex`, to rethrow.
+ */
+export function markRequestError(ex: unknown, request?: { url: string; method?: string }): unknown {
+	if (ex != null && typeof ex === 'object') {
+		requestErrors.set(
+			ex,
+			request != null && URL.canParse(request.url)
+				? { path: new URL(request.url).pathname, method: (request.method ?? 'GET').toUpperCase() }
+				: undefined,
+		);
+	}
+	return ex;
+}
+
+/**
+ * A response that names the anonymous user (`X-AUSERNAME: anonymous`) to a request that carried a credential.
+ *
+ * Jira Data Center serves a token it rejects as the anonymous user rather than refusing it: measured against Jira
+ * Data Center 10.7.3 with a revoked token, `/rest/api/2/project` answers `200 []` and a project search answers the
+ * same `400` it gives a deleted project. Read as data, that is an account with no projects, and a selected project
+ * looks deleted. The server only names `anonymous` when the credential did not authenticate, so the response is the
+ * credential's rejection whatever its status, except a 401, which already fails as one, and a 429 or a 5xx, which
+ * prove nothing about the credential.
+ *
+ * Its response keeps only the status and headers, stripped like {@link UnexpectedHtmlResponseError}'s.
+ */
+export class AnonymousResponseError extends Error {
+	static is(ex: unknown): ex is AnonymousResponseError {
+		return ex instanceof AnonymousResponseError;
+	}
+
+	readonly response: SanitizedErrorResponse;
+
+	constructor(status: number, response: ProviderErrorResponse | undefined) {
+		super(`(${status}) The provider served a request sent with a credential as the anonymous user`);
 
 		this.response = sanitizeErrorResponse(status, response);
 
@@ -137,14 +216,34 @@ export function isGitHubProviderId(
  */
 export const githubGraphQLInt32Max = 2147483647;
 
+function isGitHubGraphQLRateLimitError(providerId: IntegrationIds, ex: unknown): boolean {
+	if (!isGitHubProviderId(providerId)) return false;
+
+	const errors = (ex as { graphQLErrors?: unknown } | null | undefined)?.graphQLErrors;
+	return (
+		Array.isArray(errors) &&
+		errors.some(e => {
+			const type = (e as { type?: unknown } | null | undefined)?.type;
+			return type === 'RATE_LIMITED' || type === 'RATE_LIMIT';
+		})
+	);
+}
+
 function isLinearRateLimitError(providerId: IntegrationIds, ex: unknown): boolean {
 	if (providerId !== IssuesCloudHostIntegrationId.Linear) return false;
 
-	const body = (ex as { response?: { body?: unknown } }).response?.body;
+	return isLinearRateLimitedBody((ex as { response?: { body?: unknown } }).response?.body);
+}
+
+/** Whether a Linear GraphQL response body reports throttling. */
+export function isLinearRateLimitedBody(body: unknown): boolean {
 	return getProviderGraphQLErrors(body).some(error => error.extensions?.code === 'RATELIMITED');
 }
 
 export function isProviderIssueNotFoundError(providerId: IntegrationIds, ex: unknown): boolean {
+	// A rejected credential is not a missing issue, whatever status the server served it with.
+	if (AnonymousResponseError.is(ex)) return false;
+
 	if (providerId === IssuesCloudHostIntegrationId.Linear) {
 		return (
 			ex instanceof Error &&
@@ -152,7 +251,25 @@ export function isProviderIssueNotFoundError(providerId: IntegrationIds, ex: unk
 		);
 	}
 
-	const status = (ex as { response?: { status?: unknown } }).response?.status;
+	const response = (ex as { response?: { status?: unknown; body?: unknown } } | null | undefined)?.response;
+	const status = response?.status;
+	if (
+		providerId === IssuesCloudHostIntegrationId.Jira ||
+		providerId === IssuesSelfManagedHostIntegrationId.JiraServer
+	) {
+		// SDK reads discover fields and sites first; only the issue endpoint can prove an issue's absence.
+		const request = ex != null && typeof ex === 'object' ? requestErrors.get(ex) : undefined;
+		const messages = (response?.body as { errorMessages?: unknown } | null | undefined)?.errorMessages;
+		return (
+			status === 404 &&
+			request?.method === 'GET' &&
+			/\/rest\/api\/[23]\/issue\/[^/]+$/.test(request.path) &&
+			Array.isArray(messages) &&
+			messages.length > 0 &&
+			messages.every(message => typeof message === 'string' && message.trim().length > 0)
+		);
+	}
+
 	return status === 404 || status === 410 || status === 422;
 }
 
@@ -169,17 +286,36 @@ const jiraMissingProjectMessage = /^The value '.*' does not exist for the field 
  * `throwProviderError` wraps it in, whose `original` keeps the response.
  */
 export function isJiraMissingProjectError(ex: unknown): boolean {
+	return getJiraMissingProjectResponse(ex) != null;
+}
+
+/**
+ * {@link isJiraMissingProjectError} for Jira Data Center, which serves a credential it rejects as the anonymous user:
+ * the search then names a project the anonymous user cannot see and is refused with the very same `400`, measured
+ * against Jira Data Center 10.7.3 with a revoked token. Only the user it names in `X-AUSERNAME` tells the two apart,
+ * so a refusal that names no user, or `anonymous`, is a failure rather than a project that is gone.
+ */
+export function isJiraServerMissingProjectError(ex: unknown): boolean {
+	const user = getAuthenticatedUser(getJiraMissingProjectResponse(ex)?.headers);
+	return user != null && user !== 'anonymous';
+}
+
+function getJiraMissingProjectResponse(ex: unknown): { headers?: ResponseHeaders } | undefined {
 	for (const candidate of [ex, (ex as { original?: unknown } | undefined)?.original]) {
-		const response = (candidate as { response?: { status?: unknown; body?: unknown } } | undefined)?.response;
+		const response = (
+			candidate as { response?: { status?: unknown; body?: unknown; headers?: ResponseHeaders } } | undefined
+		)?.response;
 		if (response?.status !== 400) continue;
 
 		const messages = (response.body as { errorMessages?: unknown } | null | undefined)?.errorMessages;
 		if (!Array.isArray(messages) || messages.length === 0) continue;
 
-		return messages.every(m => typeof m === 'string' && jiraMissingProjectMessage.test(m.trim()));
+		return messages.every(m => typeof m === 'string' && jiraMissingProjectMessage.test(m.trim()))
+			? response
+			: undefined;
 	}
 
-	return false;
+	return undefined;
 }
 
 export function throwProviderError(tokenWithInfo: TokenWithInfo, error: unknown): never {
@@ -198,8 +334,17 @@ export function throwProviderError(tokenWithInfo: TokenWithInfo, error: unknown)
 			: new RequestClientError(normalizedError);
 	}
 
+	if (AnonymousResponseError.is(error)) {
+		throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Unauthorized, normalizedError);
+	}
+
 	// Linear reports GraphQL throttling as HTTP 400, so its structured code must win over generic 4xx handling.
 	if (isLinearRateLimitError(providerId, error)) {
+		throw toRateLimitError(normalizedError, token);
+	}
+
+	// GitHub reports GraphQL throttling as HTTP 200 + `errors[].type`, which the SDK throws with no `response`.
+	if (isGitHubGraphQLRateLimitError(providerId, error)) {
 		throw toRateLimitError(normalizedError, token);
 	}
 
@@ -228,6 +373,17 @@ export function throwProviderError(tokenWithInfo: TokenWithInfo, error: unknown)
 					throw new RequestClientError(normalizedError);
 				}
 		}
+	}
+
+	// A `TypeError` the request function didn't throw was thrown while reading what it returned: a body that isn't the
+	// shape the read expects (see `UnexpectedResponseError`). A transport failure that reached here some other way stays
+	// one. Neither a session expiry nor a strike toward disconnecting, as before: nothing says the credential is at
+	// fault, and the provider may answer properly next time. Logged here because a warning or a fan-out's scope failure
+	// built from it carries only the readable message, and a fan-out never reaches `handleProviderException`'s log.
+	if (error instanceof TypeError && !requestErrors.has(error) && !isProviderUnreachableError(error)) {
+		const unexpected = new UnexpectedResponseError(error);
+		Logger.warn(`${tokenWithInfo.providerId}: ${String(unexpected)}`);
+		throw unexpected;
 	}
 
 	throw error;

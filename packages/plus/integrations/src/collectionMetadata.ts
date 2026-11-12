@@ -3,6 +3,7 @@ import type {
 	CollectionOmission,
 	CollectionScope,
 	CollectionScopeFailure,
+	CollectionSkippedItems,
 } from '@gitkraken/provider-apis';
 // Matched by its `code` discriminator rather than by `instanceof`: the SDK ships one bundle per entry point, so
 // the class reached through the root is not the same object as the one reached through `/providers`.
@@ -24,7 +25,7 @@ import type {
 	ProviderWarningOmission,
 	ProviderWarningScope,
 } from './results.js';
-import { appendDedupedWarning, providerWarningMessage } from './results.js';
+import { appendDedupedWarning, getRequestFailureCause, providerWarningMessage } from './results.js';
 
 /**
  * Re-throws an error that is a fact about the CALL rather than about one scope of a fan-out.
@@ -151,13 +152,25 @@ export function toCollectionScopeFailure(scope: CollectionScopeFailure['scope'],
 	const refusal = toProviderRefusal(ex);
 	const message =
 		refusal != null ? (refusal.detail ?? providerWarningMessage((ex as AuthenticationError).original)) : undefined;
+	const cause = kind === 'provider' ? getRequestFailureCause(ex) : undefined;
 	return {
 		scope: scope,
 		kind: kind,
 		...(message ? { message: message } : ex instanceof Error && ex.message ? { message: ex.message } : {}),
 		...(refusal != null ? { refusal: refusal } : {}),
-		...(kind === 'provider' && isProviderUnreachableError(ex) ? { cause: { reason: 'unreachable' as const } } : {}),
+		...(cause != null ? { cause: cause } : {}),
 	};
+}
+
+export const unsettledMissMessage = "Nothing read for a repository that couldn't be settled";
+
+/**
+ * The failure a read records for a scope that read nothing while its repository couldn't be settled (see
+ * `GitHostIntegration.resolveRepositoryCoordinates`): it may have addressed another repository, so its miss is not a
+ * proven absence the read may publish as complete.
+ */
+export function toUnsettledScopeFailure(scope: CollectionScopeFailure['scope']): ProviderScopeFailure {
+	return toCollectionScopeFailure(scope, new Error(unsettledMissMessage));
 }
 
 function collectionFailureKindToWarningKind(kind: CollectionScopeFailure['kind']): ProviderWarning['kind'] {
@@ -180,7 +193,11 @@ function getCollectionFailureStatus(message: string | undefined): number | undef
 	return match != null ? Number(match[1]) : undefined;
 }
 
-function toCollectionFailureWarningKind(failure: CollectionScopeFailure): ProviderWarning['kind'] {
+function toCollectionFailureWarningKind(failure: ProviderScopeFailure): ProviderWarning['kind'] {
+	// First: the skipped items' own error text is embedded in the message and may well carry a status, which is not
+	// the page's. A failure that reports skipped items is never classified by its message.
+	if (failure.skippedItems != null) return 'unreadable-items';
+
 	const mapped = collectionFailureKindToWarningKind(failure.kind);
 	if (mapped !== 'other' || (failure.kind !== 'provider' && failure.kind !== 'unknown')) return mapped;
 
@@ -262,6 +279,8 @@ function causeText(cause: ProviderWarningCause): string {
 			return 'a Conditional Access policy blocked the request';
 		case 'unreachable':
 			return 'the provider server could not be reached';
+		case 'unexpected-response':
+			return 'the provider returned an unexpected response';
 		default:
 			cause.reason satisfies never;
 			return 'the provider refused the request';
@@ -461,20 +480,79 @@ export function isIncompleteCollection(metadata: CollectionMetadata | undefined)
 	return metadata.completeness !== 'complete' || (metadata.omissions?.length ?? 0) > 0;
 }
 
-/** Converts internal SDK collection metadata into neutral provider facade signals. */
+/**
+ * A failure's `skippedItems` as a well-formed one, whatever the SDK's payload held. Without an array of `keys` it names
+ * none; with one it keeps the string keys, without duplicates and in order. It counts at least the keys it names, and
+ * is `complete` only when it says so and nothing contradicts it: no key was dropped, and one that skipped items names
+ * some. Always a copy, so the failure it came from may be retained and re-merged.
+ */
+export function normalizeSkippedItems(skippedItems: CollectionSkippedItems): CollectionSkippedItems {
+	const { keys, total, complete } = (
+		typeof skippedItems === 'object' && skippedItems != null ? skippedItems : {}
+	) as {
+		keys?: unknown;
+		total?: unknown;
+		complete?: unknown;
+	};
+	const strings = Array.isArray(keys) ? keys.filter((key): key is string => typeof key === 'string') : [];
+	const named = [...new Set(strings)];
+	const count = Math.max(typeof total === 'number' && Number.isFinite(total) ? total : 0, named.length);
+	return {
+		keys: named,
+		total: count,
+		complete:
+			complete === true &&
+			Array.isArray(keys) &&
+			strings.length === keys.length &&
+			(named.length > 0 || count === 0),
+	};
+}
+
+/**
+ * `metadata` with each failure's `skippedItems` made well-formed ({@link normalizeSkippedItems}), where a Jira page
+ * enters from the SDK: `toJiraIssuePage` for the search reads, and `getPagedResult`, the generic paged path every
+ * provider's read takes (a no-op unless a failure has `skippedItems`, which only Jira's search pages set), for
+ * `getIssuesForResourceForCurrentUser`. The reads that report skipped items take no other path, so the stages after it
+ * mostly see a well-formed one. They still normalize what they read ({@link assessCollectionMetadata}, merging), so a
+ * payload that bypassed this can't throw once a read has drained every page.
+ *
+ * `skippedItems` marks a failure as a skip, and one that is an object stays one even when its payload is unusable:
+ * its message is the skipped issues' own error text and must never classify it. Anything that isn't an object is no
+ * report of skipped items and is dropped.
+ */
+export function withValidSkippedItems(metadata: CollectionMetadata | undefined): CollectionMetadata | undefined {
+	if (!metadata?.failures?.some(failure => failure.skippedItems !== undefined)) return metadata;
+
+	return {
+		...metadata,
+		failures: metadata.failures.map(({ skippedItems, ...failure }): CollectionScopeFailure => {
+			if (skippedItems == null || typeof skippedItems !== 'object') return failure;
+
+			return { ...failure, skippedItems: normalizeSkippedItems(skippedItems) };
+		}),
+	};
+}
+
+/**
+ * Converts internal SDK collection metadata into neutral provider facade signals.
+ *
+ * `requestFailed` is `fetchFailed` without the failures that only report items a read left unread: those fail the read,
+ * since the items are missing, but every request answered, so the omissions the read reported still hold.
+ */
 export function assessCollectionMetadata(
 	providerId: IntegrationIds,
 	domain: string | undefined,
 	connectionId: string | undefined,
 	metadata: CollectionMetadata | undefined,
-): { warnings: ProviderWarning[]; fetchFailed: boolean; truncated: boolean } {
-	if (metadata == null) return { warnings: [], fetchFailed: false, truncated: false };
+): { warnings: ProviderWarning[]; fetchFailed: boolean; requestFailed: boolean; truncated: boolean } {
+	if (metadata == null) return { warnings: [], fetchFailed: false, requestFailed: false, truncated: false };
 
 	const warnings: ProviderWarning[] = [];
 	const failures: ProviderScopeFailure[] = metadata.failures ?? [];
 	for (const failure of failures) {
 		const kind = toCollectionFailureWarningKind(failure);
 		const cause = toCollectionFailureCause(failure, kind);
+		const skipped = failure.skippedItems != null ? normalizeSkippedItems(failure.skippedItems) : undefined;
 		const scope = failure.credentialRefused ? undefined : toProviderWarningScope(failure.scope);
 		appendDedupedWarning(warnings, {
 			providerId: providerId,
@@ -491,6 +569,7 @@ export function assessCollectionMetadata(
 			...(scope != null ? { scope: scope } : {}),
 			// Copied for the reason the scope is: the failure object is retained and re-merged across pages.
 			...(cause != null ? { cause: { ...cause } } : {}),
+			...(skipped != null ? { unreadableItems: { keys: skipped.keys, complete: skipped.complete } } : {}),
 		});
 	}
 
@@ -532,7 +611,12 @@ export function assessCollectionMetadata(
 		});
 	}
 
-	return { warnings: warnings, fetchFailed: failures.length > 0, truncated: incomplete };
+	return {
+		warnings: warnings,
+		fetchFailed: failures.length > 0,
+		requestFailed: failures.some(failure => failure.skippedItems == null),
+		truncated: incomplete,
+	};
 }
 
 /**
@@ -555,13 +639,14 @@ export function mergeAssessmentInto(
 	domain: string | undefined,
 	connectionId: string | undefined,
 	metadata: CollectionMetadata | undefined,
-): { fetchFailed: boolean; truncated: boolean; reported: boolean } {
+): { fetchFailed: boolean; requestFailed: boolean; truncated: boolean; reported: boolean } {
 	const assessment = assessCollectionMetadata(providerId, domain, connectionId, metadata);
 	for (const warning of assessment.warnings) {
 		appendDedupedWarning(warnings, warning);
 	}
 	return {
 		fetchFailed: assessment.fetchFailed,
+		requestFailed: assessment.requestFailed,
 		truncated: assessment.truncated,
 		// What the assessment PRODUCED, not what `appendDedupedWarning` accepted: a warning dropped as a
 		// duplicate is still one the consumer will see, so it still makes a restatement redundant.

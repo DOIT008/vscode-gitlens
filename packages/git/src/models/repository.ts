@@ -36,6 +36,8 @@ export type RepositoryChange =
 	| 'stash'
 	| 'remotes'
 	| 'worktrees'
+	/** A linked worktree's HEAD moved: a checkout in a worktree whose own `.git` this session doesn't watch */
+	| 'worktreeHead'
 	| 'config'
 	| 'pausedOp'
 	| 'cherryPick'
@@ -59,6 +61,7 @@ export const repositoryChanges = exhaustiveArray<RepositoryChange>()([
 	'stash',
 	'remotes',
 	'worktrees',
+	'worktreeHead',
 	'config',
 	'pausedOp',
 	'cherryPick',
@@ -125,7 +128,8 @@ export class RepositoryWorkingTreeChangeEvent {
 	) {}
 
 	/**
-	 * Whether `uri` — or anything beneath it, when it's a folder — changed in this batch.
+	 * Whether `uri` — or anything beneath it, when it's a folder, or a folder containing it — changed in this batch.
+	 * A changed folder stands for everything beneath it (a watcher can miss the files of a just-created folder).
 	 *
 	 * Conservative: `true` whenever the batch is incomplete, since a miss would then prove nothing. Matches
 	 * on paths rather than URIs so nothing has to be allocated to answer.
@@ -134,7 +138,7 @@ export class RepositoryWorkingTreeChangeEvent {
 		if (this.incomplete) return true;
 
 		const path = uri.fsPath;
-		return some(this.paths, p => p === path || isDescendant(p, path));
+		return some(this.paths, p => p === path || isDescendant(p, path) || isDescendant(path, p));
 	}
 
 	toString(): string {

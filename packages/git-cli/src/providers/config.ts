@@ -1,4 +1,4 @@
-import { promises as fs } from 'fs';
+import { promises as fs, statSync } from 'fs';
 import { hostname, userInfo } from 'os';
 import { env as process_env } from 'process';
 import type { Cache, GkConfigInvalidationTarget, GkReconcileOutcome } from '@gitlens/git/cache.js';
@@ -14,22 +14,92 @@ import type {
 	GitConfigType,
 	GkConfigKeys,
 } from '@gitlens/git/providers/config.js';
+import { parseBranchMetadataGkConfigKey } from '@gitlens/git/utils/branch.utils.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
 import { gate } from '@gitlens/utils/decorators/gate.js';
 import { debug, trace } from '@gitlens/utils/decorators/log.js';
 import { first, some } from '@gitlens/utils/iterable.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { dirname, getBestPath, isAbsolute, joinPaths, normalizePath } from '@gitlens/utils/path.js';
+import { getSettledValue } from '@gitlens/utils/promise.js';
+import type { CacheController } from '@gitlens/utils/promiseCache.js';
 import { fileUri } from '@gitlens/utils/uri.js';
 import type { CliGitProviderInternal } from '../cliGitProvider.js';
 import { fsExists } from '../exec/exec.js';
 import type { Git } from '../exec/git.js';
+import { KeyedSequencer } from '../exec/indexLock.js';
 
 const mappedAuthorRegex = /(.+)\s<(.+)>/;
 const emptyArray: readonly never[] = Object.freeze([]);
 
 /** Catch-all pattern matching every key in `.git/gk/config` for the one-shot bulk read. */
 const gkConfigAllPattern = '.';
+
+/**
+ * Maps from failed bulk reads, which a reconcile must not diff as the file's content, each to the read that produced
+ * it. Module-wide, like {@link gkConfigMapReads}: a reconcile can join a read another provider sharing its `Cache`
+ * started.
+ */
+const failedGkConfigMaps = new WeakMap<Map<string, string>, GkConfigMapRead>();
+
+/** What the bulk read behind a cached gk config map saw of `.git/gk/config` before it spawned */
+interface GkConfigMapRead {
+	/** Set as the read spawns; until then it can only see the file as it is after every change reported so far */
+	spawned: boolean;
+	path?: string;
+	/** The file's {@link getGkConfigFingerprint} taken right before the read spawned; `undefined` when untrusted */
+	fingerprint?: string;
+}
+
+/**
+ * The read behind each commonPath's cached gk config map, per `Cache`. Recorded as the read starts, which is when
+ * the cache creates the entry for it, so it always describes the entry cached now. Kept per `Cache` rather than per
+ * provider, since providers sharing a `Cache` serve each other's reads.
+ */
+const gkConfigMapReads = new WeakMap<Cache, Map<string, GkConfigMapRead>>();
+
+/** The wall clock a read's fingerprint is checked against (see {@link isGkConfigStatRacy}), exported for testing */
+export const gkConfigFingerprintClock = { now: (): number => Date.now() };
+
+const nsPerMs = 1_000_000n;
+const nsPerSecond = 1_000_000_000n;
+
+/**
+ * Whether a stat of `.git/gk/config` taken at `statTimeMs` came too soon after the file's last change to vouch for
+ * the file staying unchanged while it matches — git's "racily clean" index entries. A later write in the same tick of
+ * the filesystem's clock as that change, of the same size and given the inode the stat saw (freed by the write in
+ * between and reused), gets the same fingerprint; once the stat is a tick past the change, any later write carries a
+ * later time. Times that are whole seconds come from a filesystem that keeps no finer (ext4 with 128-byte inodes,
+ * HFS+, FAT's 2-second mtime, some network mounts), so the stat must be 2s past; otherwise 50ms covers the coarsest
+ * tick a finer clock still has (a 10ms jiffy, Windows' 15.6ms timer) and the wall clock lagging it by one. A file
+ * changed after `statTimeMs` (a clock ahead of ours) is racy too. Exported for testing.
+ */
+export function isGkConfigStatRacy(mtimeNs: bigint, ctimeNs: bigint, statTimeMs: number): boolean {
+	const changedNs = mtimeNs > ctimeNs ? mtimeNs : ctimeNs;
+	const marginNs = mtimeNs % nsPerSecond === 0n && ctimeNs % nsPerSecond === 0n ? 2n * nsPerSecond : 50n * nsPerMs;
+	return BigInt(Math.floor(statTimeMs)) * nsPerMs - changedNs < marginNs;
+}
+
+/**
+ * A stat of `.git/gk/config` that two stats share only if no write landed between them: `git config` writes a lock
+ * file and renames it over the original, so every write gives the file a new inode, and its size and times tell
+ * apart a later write that lands on a freed inode — unless that write fell in the same clock tick as the change the
+ * first stat saw, which `statTimeMs` rules out (see {@link isGkConfigStatRacy}): given the time the stat is taken,
+ * a stat that racy is `undefined`, never matching. `'absent'` when there is no file, `undefined` when it can't be
+ * stat'd.
+ */
+function getGkConfigFingerprint(path: string, statTimeMs?: number): string | undefined {
+	try {
+		const stat = statSync(path, { bigint: true, throwIfNoEntry: false });
+		if (stat == null) return 'absent';
+		if (statTimeMs != null && isGkConfigStatRacy(stat.mtimeNs, stat.ctimeNs, statTimeMs)) return undefined;
+
+		return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+	} catch {
+		return undefined;
+	}
+}
 
 /**
  * Canonicalizes a git config key for lookup against `--get-regexp` output, which git emits with the
@@ -86,6 +156,33 @@ export function parseConfigRegexOutput(
 	return configMap;
 }
 
+/**
+ * Parses `git config --null --get-regexp` output into every value of each key, in the order git printed them. Each
+ * entry is its key, a newline and its value, ended by a NUL, so a value may hold newlines or spaces unambiguously.
+ * A valueless entry (`key`, no `=`), which git prints with no newline, is skipped, as {@link parseConfigRegexOutput}
+ * skips it by default.
+ */
+export function parseConfigRegexNullOutput(data: string | undefined): Map<string, string[]> {
+	const configMap = new Map<string, string[]>();
+	if (!data) return configMap;
+
+	for (const entry of data.split('\0')) {
+		const newlineIndex = entry.indexOf('\n');
+		if (newlineIndex === -1) continue;
+
+		const key = entry.substring(0, newlineIndex);
+		const value = entry.substring(newlineIndex + 1);
+		const values = configMap.get(key);
+		if (values != null) {
+			values.push(value);
+		} else {
+			configMap.set(key, [value]);
+		}
+	}
+
+	return configMap;
+}
+
 export function parseGitBoolean(value: string | undefined): boolean {
 	if (value == null) return false;
 
@@ -99,6 +196,52 @@ export function isGitBooleanFalse(value: string): boolean {
 	return (
 		normalized === '' || normalized === 'false' || normalized === 'no' || normalized === 'off' || normalized === '0'
 	);
+}
+
+/** Splits `git config --null --get-regexp` output into its entries, in order; a key set without a value has none */
+export function parseConfigListing(listing: string): [key: string, value: string | undefined][] {
+	const entries: [key: string, value: string | undefined][] = [];
+	for (const entry of listing.split('\0')) {
+		if (!entry) continue;
+
+		const separator = entry.indexOf('\n');
+		entries.push(
+			separator < 0 ? [entry, undefined] : [entry.substring(0, separator), entry.substring(separator + 1)],
+		);
+	}
+	return entries;
+}
+
+/**
+ * Whether `listing` shows config that can differ by checkout over time: `extensions.worktreeConfig` (each checkout's
+ * `config.worktree`), or a conditional include that is neither `hasconfig:` nor `gitdir:`, since `onbranch:` follows
+ * each checkout's HEAD and an unknown condition might follow anything. A `gitdir:` include matching only some
+ * checkouts is accepted as shared: it is the common identity setup, and treating it as differing would end sharing for
+ * nearly everyone. The cost is a known gap: an edit to a file only those checkouts include goes unseen there, since
+ * nothing watches it, until a change the shared listing does see.
+ */
+export function mayConfigDifferByCheckout(listing: string): boolean {
+	for (const [key, value] of parseConfigListing(listing)) {
+		if (key === 'extensions.worktreeconfig') {
+			// A key set without a value is true
+			if (value == null || !isGitBooleanFalse(value)) return true;
+
+			continue;
+		}
+		if (!key.startsWith('includeif.')) continue;
+
+		const condition = key.substring('includeif.'.length, key.lastIndexOf('.'));
+		if (
+			condition.startsWith('hasconfig:') ||
+			condition.startsWith('gitdir:') ||
+			condition.startsWith('gitdir/i:')
+		) {
+			continue;
+		}
+
+		return true;
+	}
+	return false;
 }
 
 export class ConfigGitSubProvider implements GitConfigSubProvider {
@@ -120,13 +263,18 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 	private readonly _gkConfigReconciles = new Map<string, { pending: boolean; paths: Map<string, number> }>();
 
 	/**
-	 * Pending `setGkConfig` writes keyed by `(commonPath, key, value, skip-option)`. Concurrent
-	 * callers writing the same `(key, value)` pair share the in-flight Promise so only one
-	 * `git config --set` subprocess actually runs. Cleared on settle.
+	 * The latest pending `setGkConfig` write of each `commonPath\0key`. A call writing the same value with the same
+	 * invalidation and error options joins it; any other call chains after it, so one key's writes land in call order. Cleared on settle.
 	 */
-	private readonly _pendingGkConfigWrites = new Map<string, Promise<void>>();
+	private readonly _pendingGkConfigWrites = new Map<
+		string,
+		{ value: string | undefined; skipKey: string; throwOnError: boolean; promise: Promise<void> }
+	>();
 
-	@trace()
+	/** Writes each `.git/gk/config` one at a time — concurrent `git config` writes fail on its lock */
+	private readonly _gkConfigWrites = new KeyedSequencer();
+
+	@trace({ quiet: true })
 	getConfig(
 		repoPath: string | undefined,
 		key: GitConfigKeys,
@@ -161,7 +309,65 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		return result.stdout.trim() || undefined;
 	}
 
-	@trace()
+	/**
+	 * A checkout's raw `core.excludesFile` and `core.ignorecase`, the config its gitignore filter loads. Every checkout
+	 * of a repository shares one read in the main checkout, unless the listing shows config that can differ by checkout
+	 * (see `mayConfigDifferByCheckout`) or the read failed; then a linked checkout reads its own.
+	 */
+	@trace({ quiet: true })
+	async getIgnoreConfig(
+		repoPath: string,
+	): Promise<{ excludesFile: string | undefined; ignoreCase: string | undefined }> {
+		const commonPath = this.cache.getCommonPath(repoPath);
+		const listing = await this.cache.getIgnoreConfigListing(repoPath, (path, cacheable, signal) =>
+			this.readIgnoreConfigListing(path, cacheable, signal),
+		);
+		if (listing != null && (repoPath === commonPath || !mayConfigDifferByCheckout(listing))) {
+			let excludesFile: string | undefined;
+			let ignoreCase: string | undefined;
+			// A key can repeat, and git answers with the last
+			for (const [key, value] of parseConfigListing(listing)) {
+				if (key === 'core.excludesfile') {
+					excludesFile = value?.trim() || undefined;
+				} else if (key === 'core.ignorecase') {
+					// A key set without a value is true
+					ignoreCase = value == null ? 'true' : value.trim() || undefined;
+				}
+			}
+			return { excludesFile: excludesFile, ignoreCase: ignoreCase };
+		}
+
+		const [excludesFileResult, ignoreCaseResult] = await Promise.allSettled([
+			this.getConfig(repoPath, 'core.excludesFile'),
+			this.getConfig(repoPath, 'core.ignorecase'),
+		]);
+		return { excludesFile: getSettledValue(excludesFileResult), ignoreCase: getSettledValue(ignoreCaseResult) };
+	}
+
+	private async readIgnoreConfigListing(
+		cwd: string,
+		cacheable: CacheController,
+		cancellation: AbortSignal | undefined,
+	): Promise<string | undefined> {
+		// Conditional includes and `extensions.worktreeConfig` tell whether one checkout's listing holds for the others.
+		// Exit 1 is nothing set, a real answer; a failure must not reject, as the filter's per-checkout reads never did
+		const result = await this.git.run(
+			{ cwd: cwd, cancellation: cancellation, errors: 'ignore' },
+			'config',
+			'--null',
+			'--get-regexp',
+			'^(core\\.excludesfile|core\\.ignorecase|includeif\\..*|extensions\\.worktreeconfig)$',
+		);
+		if (cancellation?.aborted) throw new CancellationError();
+
+		if (result.completion.status !== 'exited' || (result.exitCode !== 0 && result.exitCode !== 1)) {
+			cacheable.invalidate();
+			return undefined;
+		}
+		return result.stdout;
+	}
+
+	@trace({ quiet: true })
 	getConfigRegex(
 		repoPath: string | undefined,
 		pattern: string,
@@ -171,6 +377,37 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		return this.cache.getConfigRegex(global ? undefined : repoPath, pattern, () =>
 			this.getConfigRegexCore(repoPath, pattern, options),
 		);
+	}
+
+	/**
+	 * Every value of each key matching `pattern` (`git config --get-regexp`), for a key git lets repeat, like
+	 * `remote.<name>.fetch`: {@link getConfigRegex} keeps only each key's last value. Cached beside it, so the same
+	 * writes and config changes clear it. Rejects when git couldn't read the configuration.
+	 */
+	@trace({ quiet: true })
+	async getConfigRegexAll(repoPath: string, pattern: string): Promise<Map<string, string[]>> {
+		// Under a key no regex is spelled as, with each key's values joined by a NUL, which no value can hold
+		// Read from, and cached under, the common path, never the caller's checkout: every worktree is served this one
+		// entry, so it must not take in a `config.worktree` of whichever checkout happened to read first
+		const commonPath = this.cache.getCommonPath(repoPath);
+		const joined = await this.cache.getConfigRegex(commonPath, `\0all\0${pattern}`, async () => {
+			const result = await this.git.run(
+				{ cwd: commonPath, errors: 'ignore' },
+				'config',
+				'--null',
+				'--get-regexp',
+				pattern,
+			);
+			// 1 is git's exit code for no key matching
+			if (result.completion.status !== 'exited' || (result.exitCode !== 0 && result.exitCode !== 1)) {
+				throw new Error(`Unable to read the config keys matching '${pattern}'`);
+			}
+
+			return new Map(
+				Array.from(parseConfigRegexNullOutput(result.stdout), ([key, values]) => [key, values.join('\0')]),
+			);
+		});
+		return new Map(Array.from(joined, ([key, value]) => [key, value.split('\0')]));
 	}
 
 	private async getConfigRegexCore(
@@ -210,13 +447,18 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		if (repoPath != null && !options?.file && /^branch\..+\.(?:remote|merge)$/i.test(key)) {
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
 		}
+
+		// A `--global` or custom-`file` write isn't this repository's `.git/config`
+		if (repoPath != null && !options?.file && !options?.global) {
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['config']);
+		}
 	}
 
 	private async setConfigCore(
 		repoPath: string | undefined,
 		key: string,
 		value: string | undefined,
-		options?: { file?: string; global?: boolean },
+		options?: { file?: string; global?: boolean; throwOnError?: boolean },
 	): Promise<void> {
 		const args: string[] = ['config'];
 
@@ -233,7 +475,10 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 			args.push(key, value);
 		}
 
-		await this.git.run({ cwd: repoPath ?? '', runLocally: true }, ...args);
+		await this.git.run(
+			{ cwd: repoPath ?? '', runLocally: true, errors: options?.throwOnError ? 'throw' : undefined },
+			...args,
+		);
 
 		// Only invalidate cache when not using a custom file (custom files aren't cached)
 		if (!options?.file) {
@@ -244,7 +489,7 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 	}
 
 	@gate()
-	@debug()
+	@debug({ quiet: true })
 	async getCurrentUser(repoPath: string): Promise<GitUser | undefined> {
 		if (!repoPath) return undefined;
 
@@ -303,7 +548,7 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 	}
 
 	@gate()
-	@trace({ exit: r => `returned ${r}` })
+	@trace({ quiet: true, exit: r => `returned ${r}` })
 	async getDefaultWorktreePath(repoPath: string): Promise<string | undefined> {
 		const gitDir = await this.getGitDir(repoPath);
 		if (gitDir == null) return undefined;
@@ -314,6 +559,7 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 
 	@gate()
 	@trace({
+		quiet: true,
 		exit: r =>
 			`returned ${r.uri.toString(true)}, commonUri=${r.commonUri?.toString(true)}, parentUri=${r.parentUri?.toString(true)}`,
 	})
@@ -362,16 +608,70 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		return joinPaths(basePath, 'gk', 'config');
 	}
 
-	@debug()
-	async getGkConfig(repoPath: string, key: GkConfigKeys | DeprecatedGkConfigKeys): Promise<string | undefined> {
+	@trace({ quiet: true })
+	async getGkConfig(
+		repoPath: string,
+		key: GkConfigKeys | DeprecatedGkConfigKeys,
+		options?: { throwOnError?: boolean },
+	): Promise<string | undefined> {
+		if (options?.throwOnError) return this.getGkConfigStrict(repoPath, key);
+
 		// Served in-memory from a single bulk read of the whole `.git/gk/config` (no gk read needs `--type`).
 		// Canonicalize the key the way git does for `--get-regexp` output so subsection-less keys
 		// (e.g. `gk.defaultRemote`) match, and coerce an empty value to undefined to match the old
 		// `git config --get` (`.trim() || undefined`) contract.
-		return (await this.getGkConfigMap(repoPath)).get(canonicalizeGitConfigKey(key)) || undefined;
+		const map = await this.getGkConfigMap(repoPath);
+		return map.get(canonicalizeGitConfigKey(key)) || undefined;
 	}
 
-	@debug()
+	private async getGkConfigStrict(
+		repoPath: string,
+		key: GkConfigKeys | DeprecatedGkConfigKeys,
+	): Promise<string | undefined> {
+		await this.migrateGkConfigFromGitConfig(this.cache.getCommonPath(repoPath));
+		const path = await this.getGkConfigPath(repoPath);
+		if (path == null) throw new Error('Unable to locate GitKraken config storage');
+
+		try {
+			await fs.lstat(path);
+		} catch (ex) {
+			if ((ex as NodeJS.ErrnoException).code !== 'ENOENT') throw ex;
+
+			// Windows also reports ENOENT for a child beneath a file, so absence needs a directory parent.
+			for (const parent of [dirname(path), dirname(dirname(path))]) {
+				const entry = await fs.lstat(parent).catch((parentError: unknown) => {
+					if ((parentError as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+
+					throw parentError;
+				});
+				if (entry == null) continue;
+
+				if (entry.isDirectory() || (entry.isSymbolicLink() && (await fs.stat(parent)).isDirectory())) {
+					return undefined;
+				}
+				break;
+			}
+
+			throw ex;
+		}
+
+		// Listing has no ambiguous "no matching key" exit code; storage failures must stop read-modify-write.
+		const result = await this.git.run(
+			{ cwd: repoPath, errors: 'throw', runLocally: true },
+			'config',
+			'--null',
+			'--list',
+			'-f',
+			path,
+		);
+		if (result.completion.status !== 'exited' || result.exitCode !== 0) {
+			throw new Error('Unable to read GitKraken config');
+		}
+
+		return parseConfigRegexNullOutput(result.stdout).get(canonicalizeGitConfigKey(key))?.at(-1) || undefined;
+	}
+
+	@trace({ quiet: true })
 	async getGkConfigRegex(repoPath: string, pattern: string): Promise<Map<string, string>> {
 		const all = await this.getGkConfigMap(repoPath);
 
@@ -403,28 +703,78 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 	private async getGkConfigMap(repoPath: string): Promise<Map<string, string>> {
 		// Migrate BEFORE populating the cache, not inside the factory: a first-time migration calls
 		// clearCaches('gkConfig'), which would otherwise evict the in-flight gkConfigMap entry the
-		// cache wrapper synchronously stored and force a redundant bulk re-read.
-		await this.migrateGkConfigFromGitConfig(this.cache.getCommonPath(repoPath));
+		// cache wrapper synchronously stored and force a redundant bulk re-read. Checked here too, not only in the
+		// migration: every gk lookup lands here, and entering the migration logs it.
+		const commonPath = this.cache.getCommonPath(repoPath);
+		if (!this._migratedRepos.has(commonPath)) {
+			await this.migrateGkConfigFromGitConfig(commonPath);
+		}
 		return this.cache.getGkConfigMap(repoPath, async cacheable => {
-			const { map, failed } = await this.getGkConfigRegexCore(repoPath, gkConfigAllPattern);
+			const read = this.trackGkConfigMapRead(repoPath);
+			const { map, failed } = await this.getGkConfigRegexCore(repoPath, gkConfigAllPattern, read);
 			// This map has no TTL and everything gk-related reads through it, so a failed read cached as an
 			// empty map would report every branch as having no stored base or merge target for the session —
 			// and would make the section-cleanup pre-checks skip real work. Only cache a read that happened.
 			if (failed) {
 				cacheable.invalidate();
+				failedGkConfigMaps.set(map, read);
 			}
 			return map;
 		});
 	}
 
+	/** Records the read that is creating `repoPath`'s cached gk config map (see {@link gkConfigMapReads}) */
+	private trackGkConfigMapRead(repoPath: string): GkConfigMapRead {
+		let reads = gkConfigMapReads.get(this.cache);
+		if (reads == null) {
+			reads = new Map();
+			gkConfigMapReads.set(this.cache, reads);
+		}
+
+		const read: GkConfigMapRead = { spawned: false };
+		reads.set(this.cache.getCommonPath(repoPath), read);
+		return read;
+	}
+
+	/**
+	 * Hard-evicts the cached gk config map, unless `.git/gk/config` is unchanged since the read behind it stat'd the
+	 * file, or that read is yet to spawn. The stat is taken before the read, so a write landing between the two
+	 * only costs a re-read on its report, never a missed change. Returns the read it kept, if any.
+	 */
+	private evictGkConfigMapIfChanged(repoPath: string): GkConfigMapRead | undefined {
+		const read = gkConfigMapReads.get(this.cache)?.get(this.cache.getCommonPath(repoPath));
+		if (read != null) {
+			if (!read.spawned) return read;
+			if (
+				read.path != null &&
+				read.fingerprint != null &&
+				getGkConfigFingerprint(read.path) === read.fingerprint
+			) {
+				return read;
+			}
+		}
+
+		this.cache.deleteGkConfigMap(repoPath);
+		return undefined;
+	}
+
 	private async getGkConfigRegexCore(
 		repoPath: string,
 		pattern: string,
+		read: GkConfigMapRead,
 	): Promise<{ map: Map<string, string>; failed: boolean }> {
 		const gkConfigPath = await this.getGkConfigPath(repoPath);
-		// No `.git/gk/config` yet is a real answer, not a failure — a repo GitLens has never written to.
-		if (!gkConfigPath) return { map: new Map(), failed: false };
+		if (!gkConfigPath) {
+			read.spawned = true;
+			// No `.git/gk/config` yet is a real answer, not a failure — a repo GitLens has never written to.
+			return { map: new Map(), failed: false };
+		}
 
+		// Taken before the spawn, never after: a write landing in between then only makes its report re-read the file.
+		// The clock is read before the stat, so the stat is no earlier than the time it's checked against.
+		read.path = gkConfigPath;
+		read.fingerprint = getGkConfigFingerprint(gkConfigPath, gkConfigFingerprintClock.now());
+		read.spawned = true;
 		const result = await this.git.run(
 			{ cwd: repoPath, errors: 'ignore', runLocally: true },
 			'config',
@@ -448,25 +798,41 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		repoPath: string,
 		key: GkConfigKeys | DeprecatedGkConfigKeys,
 		value: string | undefined,
-		options?: { skipInvalidation?: readonly GkConfigInvalidationTarget[] },
+		options?: { skipInvalidation?: readonly GkConfigInvalidationTarget[]; throwOnError?: boolean },
 	): Promise<void> {
-		// Encode the skip-invalidation option in the dedup key: a self-write (with skip targets)
-		// and a user-driven write of the same `(key, value)` (no skip targets) have different
-		// cache-invalidation semantics, so sharing their Promise would silently let the user-driven
-		// write skip invalidation. Sort the array so callers passing the same targets in different
-		// orders share a single in-flight write.
+		// A self-write (with skip targets) and a user-driven write of the same value have different invalidation
+		// semantics, so only a matching skip option may join: otherwise the user-driven write would skip invalidation.
+		// Sorted, so the same targets in any order match.
 		const commonPath = this.cache.getCommonPath(repoPath);
 		const skipKey = options?.skipInvalidation?.length ? options.skipInvalidation.toSorted().join(',') : '';
-		const dedupKey = `${commonPath}\0${key}\0${value ?? ''}\0${skipKey}`;
+		const pendingKey = `${commonPath}\0${key}`;
+		const throwOnError = options?.throwOnError === true;
 
-		const pending = this._pendingGkConfigWrites.get(dedupKey);
-		if (pending != null) return pending;
+		const previous = this._pendingGkConfigWrites.get(pendingKey);
+		if (
+			previous != null &&
+			previous.value === value &&
+			previous.skipKey === skipKey &&
+			previous.throwOnError === throwOnError
+		) {
+			return previous.promise;
+		}
 
-		const promise = this.setGkConfigCore(repoPath, key, value, options);
-		this._pendingGkConfigWrites.set(dedupKey, promise);
+		const promise =
+			previous != null
+				? previous.promise.catch(() => {}).then(() => this.setGkConfigCore(repoPath, key, value, options))
+				: this.setGkConfigCore(repoPath, key, value, options);
+		const pending = { value: value, skipKey: skipKey, throwOnError: throwOnError, promise: promise };
+		this._pendingGkConfigWrites.set(pendingKey, pending);
 		// Swallow the cleanup chain's rejection so a failed write doesn't surface as an unhandled
 		// rejection separate from the caller's own handling of the returned promise.
-		void promise.finally(() => this._pendingGkConfigWrites.delete(dedupKey)).catch(() => {});
+		void promise
+			.finally(() => {
+				if (this._pendingGkConfigWrites.get(pendingKey) === pending) {
+					this._pendingGkConfigWrites.delete(pendingKey);
+				}
+			})
+			.catch(() => {});
 		return promise;
 	}
 
@@ -474,30 +840,59 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		repoPath: string,
 		key: GkConfigKeys | DeprecatedGkConfigKeys,
 		value: string | undefined,
-		options?: { skipInvalidation?: readonly GkConfigInvalidationTarget[] },
+		options?: { skipInvalidation?: readonly GkConfigInvalidationTarget[]; throwOnError?: boolean },
 	): Promise<void> {
 		const scope = getScopedLogger();
 
 		const gkConfigPath = await this.getGkConfigPath(repoPath);
-		if (!gkConfigPath) return;
+		if (!gkConfigPath) {
+			if (options?.throwOnError) throw new Error('Unable to locate GitKraken config storage');
+
+			return;
+		}
 
 		const gkConfigFolder = joinPaths(gkConfigPath, '..');
 
-		if (!(await this.ensureGkConfigFolder(gkConfigFolder, scope))) return;
+		if (!(await this.ensureGkConfigFolder(gkConfigFolder, scope))) {
+			if (options?.throwOnError) throw new Error('Unable to prepare GitKraken config storage');
 
-		await this.setConfigCore(repoPath, key, value, { file: gkConfigPath });
+			return;
+		}
+
+		// Seed the reconcile snapshot from the pre-write file, so the write below can tell whether it changed the
+		// value (first tracked-key write per repository only; the bulk read is cached for everything else)
+		if (this.cache.needsGkConfigSnapshot(repoPath, key)) {
+			await this.getGkConfigMap(repoPath);
+		}
+
+		await this._gkConfigWrites.run(gkConfigPath, undefined, () =>
+			this.setConfigCore(repoPath, key, value, { file: gkConfigPath, throwOnError: options?.throwOnError }),
+		);
 
 		// Invalidate the bulk map (so the next read re-fetches) and the derived caches for this key's
-		// ref. The `.git/gk/config` file-watcher also fires `'gkConfig'` shortly after, which reconciles
+		// ref, then record the write, which fires `onDidChangeMergeTargets` when it changed a merge key —
+		// except for a self-write (`skipInvalidation` given: an internal save while answering a read), which
+		// nobody awaits; only another process's watcher reports that one.
+		// The `.git/gk/config` file-watcher also fires `'gkConfig'` shortly after, which reconciles
 		// the same change (see `reconcileGkConfig`) — recording our own write here keeps that later
 		// reconcile from re-diffing this key as an external change.
 		this.cache.deleteGkConfig(repoPath, key, options);
-		this.cache.recordGkConfigWrite(repoPath, key, value);
+		this.cache.recordGkConfigWrite(repoPath, key, value, { announce: options?.skipInvalidation == null });
+
+		// The watcher's report of this write can't reach the cached branches: the snapshot already holds the value
+		const metadataKey = parseBranchMetadataGkConfigKey(key);
+		if (metadataKey != null) {
+			this.cache.patchBranchMetadata(repoPath, [
+				{ branch: metadataKey.branch, key: metadataKey.key, value: value },
+			]);
+		}
 	}
 
 	@debug()
 	async removeGkConfigBranchSection(repoPath: string, ref: string): Promise<void> {
-		await this.runGkConfigSectionCommand(repoPath, ref, '--remove-section', `branch.${ref}`);
+		if (await this.runGkConfigSectionCommand(repoPath, ref, '--remove-section', `branch.${ref}`)) {
+			this.cache.recordGkConfigSectionWrite(repoPath, ref);
+		}
 	}
 
 	@debug()
@@ -509,13 +904,17 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		// the source has no gk keys at all, where its pre-check would otherwise skip the whole call and
 		// leave the orphan in place for the renamed branch to inherit.
 		await this.removeGkConfigBranchSection(repoPath, newRef);
-		await this.runGkConfigSectionCommand(
-			repoPath,
-			oldRef,
-			'--rename-section',
-			`branch.${oldRef}`,
-			`branch.${newRef}`,
-		);
+		if (
+			await this.runGkConfigSectionCommand(
+				repoPath,
+				oldRef,
+				'--rename-section',
+				`branch.${oldRef}`,
+				`branch.${newRef}`,
+			)
+		) {
+			this.cache.recordGkConfigSectionWrite(repoPath, oldRef, newRef);
+		}
 	}
 
 	/**
@@ -526,8 +925,11 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 	 * Never throws: callers invoke this as bookkeeping after a branch op has already succeeded, so a
 	 * failure here must not be reported as (or roll back) the branch/checkout/worktree operation itself.
 	 * The worst case is metadata that stays behind until the next op on that name.
+	 *
+	 * Returns whether `.git/gk/config` now reflects the command (it ran, or there was nothing to do), so the
+	 * caller can record its own write in the reconcile snapshot only when it actually landed.
 	 */
-	private async runGkConfigSectionCommand(repoPath: string, ref: string, ...args: string[]): Promise<void> {
+	private async runGkConfigSectionCommand(repoPath: string, ref: string, ...args: string[]): Promise<boolean> {
 		const scope = getScopedLogger();
 		try {
 			const prefix = `branch.${ref}.`;
@@ -537,27 +939,30 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 			// read as authoritative would skip the removal entirely, leaving a deleted branch's base,
 			// disposition and issue links behind for the next branch reusing that name. When it's empty, run
 			// the command: worst case is a no-op on a section that isn't there.
-			if (map.size && !some(map.keys(), k => k.startsWith(prefix))) return;
+			if (map.size && !some(map.keys(), k => k.startsWith(prefix))) return true;
 
 			const gkConfigPath = await this.getGkConfigPath(repoPath);
-			if (!gkConfigPath) return;
+			if (!gkConfigPath) return false;
 			// `getGkConfigPath` only joins a path, so check the file: with no `.git/gk/config` there is
 			// genuinely nothing to remove, and running the command would fail with a fatal we'd then warn
 			// about on every branch delete in a repo that has never had gk metadata.
-			if (!(await fsExists(gkConfigPath))) return;
+			if (!(await fsExists(gkConfigPath))) return true;
 
-			const result = await this.git.run(
-				{ cwd: repoPath, runLocally: true, errors: 'ignore' },
-				'config',
-				'-f',
-				gkConfigPath,
-				...args,
+			const result = await this._gkConfigWrites.run(gkConfigPath, undefined, () =>
+				this.git.run(
+					{ cwd: repoPath, runLocally: true, errors: 'ignore' },
+					'config',
+					'-f',
+					gkConfigPath,
+					...args,
+				),
 			);
 			// `errors: 'ignore'` is deliberate — see the note above on why this must never throw — but that
 			// also means the `catch` below never sees a failed write, so without this the metadata silently
 			// stays behind (or, on a rename, stays under the old name) with nothing recorded anywhere.
 			// Reported, not thrown: the branch op it follows has already succeeded.
-			if (result.completion.status !== 'exited' || result.exitCode !== 0) {
+			const succeeded = result.completion.status === 'exited' && result.exitCode === 0;
+			if (!succeeded) {
 				scope?.warn(
 					`Failed to update gk config section for '${ref}' in '${repoPath}': ${
 						result.completion.status === 'exited'
@@ -570,16 +975,21 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 			// Drop the bulk map so the next read hits disk; the derived caches for the affected ref are
 			// evicted by the caller's own `deleteBaseBranchName` plus the `'branches'` cascade it fires.
 			this.cache.deleteGkConfigMap(repoPath);
+			return succeeded;
 		} catch (ex) {
 			scope?.error(ex, `Failed to update gk config section for '${ref}' in '${repoPath}'`);
+			return false;
 		}
 	}
 
 	/**
 	 * Reconciles a watcher-observed `'gkConfig'` change — registered with the shared `Cache` as its
-	 * gk-config reconciler (see the constructor). Re-reads the bulk map (hard-evicted by
-	 * `Cache.handleGkConfigChanged`, so this hits disk) and diffs it against `priorSnapshot` to cascade
-	 * `baseBranchName`/`branchOverviews` only for refs whose merge-relevant keys actually changed.
+	 * gk-config reconciler (see the constructor). Hard-evicts the bulk map as the change is reported, unless the file
+	 * is unchanged since the map was read (see `evictGkConfigMapIfChanged`), then reads it (from disk, or the map
+	 * kept) and diffs it against `priorSnapshot` to cascade
+	 * `baseBranchName`/`branchOverviews` only for refs whose merge-relevant keys actually changed, and to evict the
+	 * branches only when a branch metadata key (another process's activity stamp) changed. The diff runs on a kept
+	 * map too: a read can land between an external write and its report, and already hold the change.
 	 *
 	 * Serialized per commonPath: a reconcile is a read-then-diff against a single shared baseline, so
 	 * two overlapping passes would both diff against the same snapshot and the later change could fall
@@ -587,10 +997,10 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 	 * diffs against the baseline the previous pass just established.
 	 *
 	 * `.git/gk/config` lives in the common dir, so the watcher delivers one event per worktree sharing it
-	 * (see `WatchGroup.onCommonEvent`). Siblings never run concurrently — the later ones fold into the
-	 * in-flight pass — but folding in arms the trailing pass, so a fan-out costs one extra read that
-	 * re-reads and diffs an unchanged file. However many siblings land while a pass is running, they
-	 * coalesce into that single trailing pass; the cost is the price of never dropping a real change.
+	 * (see `WatchGroup.onCommonEvent`), and core's own write is reported too. Siblings never run concurrently — the
+	 * later ones fold into the in-flight pass — but folding in arms the trailing pass, which re-diffs the map unless
+	 * the file changed again. However many siblings land while a pass is running, they coalesce into that single
+	 * trailing pass; the cost is the price of never dropping a real change.
 	 * Every reporting path is retained because `Repository` matches the follow-up change event on exact
 	 * path, and a sibling worktree that never receives one would sit on stale derived values.
 	 */
@@ -602,6 +1012,9 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 
 		const inflight = this._gkConfigReconciles.get(commonPath);
 		if (inflight != null) {
+			// Now, not in the trailing pass: a read between this report and that pass must see the change, and would
+			// otherwise join the map read before it
+			this.evictGkConfigMapIfChanged(repoPath);
 			inflight.paths.set(repoPath, this.cache.getCloseGeneration(repoPath));
 			inflight.pending = true;
 			// Handed to the in-flight pass's trailing loop, so it IS being reconciled — just not by this
@@ -644,9 +1057,21 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 				// nothing left holding a stale derived value either.
 				if (readPath == null) return 'reconciled';
 
-				// A trailing pass must not reuse the entry the pass before it installed.
-				this.cache.deleteGkConfigMap(readPath);
-				const freshMap = await this.getGkConfigMap(readPath);
+				// Runs before this pass's first await, so a first pass decides as the change is reported; a trailing one
+				// re-checks the map the pass before it read
+				const kept = this.evictGkConfigMapIfChanged(readPath);
+				let freshMap = await this.getGkConfigMap(readPath);
+				// A kept read that failed was started before this pass, which would otherwise have read the file
+				// itself, so it gets one fresh read before the coarse fallback
+				if (kept != null && failedGkConfigMaps.get(freshMap) === kept) {
+					this.cache.deleteGkConfigMap(readPath);
+					freshMap = await this.getGkConfigMap(readPath);
+				}
+				// A failed read diffed as the file's content would remove every key it missed
+				if (failedGkConfigMaps.has(freshMap)) {
+					throw new Error(`Failed to read the gk config through '${readPath}'`);
+				}
+
 				// Paths may have closed while the re-read was in flight; if every one did, there's nothing
 				// left to reconcile against.
 				if (!this.pruneClosedReconcilePaths(entry.paths).size) return 'reconciled';
@@ -654,15 +1079,16 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 				if (this.cache.reconcileGkConfigMap(readPath, snapshot, freshMap)) {
 					// Fire a follow-up change: a consumer that re-read on the original event may have done so
 					// before this async cascade landed, so it would otherwise hold a stale derived value with
-					// nothing left to prompt another re-read.
+					// nothing left to prompt another re-read. Only the host hears it: it is not a write of
+					// core's, and announcing it as one would evict the map just reconciled.
 					for (const path of entry.paths.keys()) {
-						this.context.hooks?.repository?.onChanged?.(path, ['gkConfig']);
+						this.provider.notifyHost(path, ['gkConfig']);
 					}
 				}
 
 				// `reconcileGkConfigMap` advanced the stored baseline to what we just read; a trailing pass
 				// diffs its own read against that.
-				snapshot = this.cache.getGkConfigMergeSnapshot(readPath);
+				snapshot = this.cache.getGkConfigSnapshot(readPath);
 			} while (entry.pending);
 
 			return 'reconciled';
@@ -676,7 +1102,7 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		}
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async getSigningConfig(repoPath: string): Promise<SigningConfig> {
 		// Fetch all signing-related config in one call
 		const configMap = await this.getConfigRegex(
@@ -707,7 +1133,7 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		};
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async validateSigningSetup(repoPath: string): Promise<ValidationResult> {
 		const config = await this.getSigningConfig(repoPath);
 
@@ -728,28 +1154,40 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 	): Promise<void> {
 		const scope = getScopedLogger();
 
+		const entries: [GitConfigKeys, string][] = [];
+		if (config.enabled != null) {
+			entries.push(['commit.gpgsign', config.enabled ? 'true' : 'false']);
+		}
+		if (config.format != null) {
+			entries.push(['gpg.format', config.format]);
+		}
+		if (config.signingKey != null) {
+			entries.push(['user.signingkey', config.signingKey]);
+		}
+		if (config.gpgProgram != null) {
+			entries.push(['gpg.program', config.gpgProgram]);
+		}
+		if (config.sshProgram != null) {
+			entries.push(['gpg.ssh.program', config.sshProgram]);
+		}
+		if (config.allowedSignersFile != null) {
+			entries.push(['gpg.ssh.allowedSignersFile', config.allowedSignersFile]);
+		}
+
+		let wrote = false;
 		try {
-			if (config.enabled != null) {
-				await this.setConfig(repoPath, 'commit.gpgsign', config.enabled ? 'true' : 'false', options);
-			}
-			if (config.format != null) {
-				await this.setConfig(repoPath, 'gpg.format', config.format, options);
-			}
-			if (config.signingKey != null) {
-				await this.setConfig(repoPath, 'user.signingkey', config.signingKey, options);
-			}
-			if (config.gpgProgram != null) {
-				await this.setConfig(repoPath, 'gpg.program', config.gpgProgram, options);
-			}
-			if (config.sshProgram != null) {
-				await this.setConfig(repoPath, 'gpg.ssh.program', config.sshProgram, options);
-			}
-			if (config.allowedSignersFile != null) {
-				await this.setConfig(repoPath, 'gpg.ssh.allowedSignersFile', config.allowedSignersFile, options);
+			for (const [key, value] of entries) {
+				await this.setConfigCore(repoPath, key, value, options);
+				wrote = true;
 			}
 		} catch (ex) {
 			scope?.error(ex);
 			throw ex;
+		} finally {
+			// One `config` announcement for the keys written, rather than one (each fanned out to every worktree) per key
+			if (wrote && !options?.global) {
+				this.context.hooks?.repository?.onChanged?.(repoPath, ['config']);
+			}
 		}
 	}
 
@@ -865,7 +1303,10 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 				if (result.stdout.trim() === 'true') {
 					const result = await this.revParseGitDir(cwd);
 					const repoPath = result?.commonPath ?? result?.path;
-					if (repoPath?.length) return [true, repoPath];
+					if (repoPath?.length) {
+						const workTree = await this.git.rev_parse__work_tree_of_git_dir(repoPath);
+						return workTree ? this.getRepositoryInfo(workTree) : [true, repoPath];
+					}
 				}
 			}
 
@@ -1000,7 +1441,9 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		// Copy legacy entries to .git/gk/config
 		for (const [key, value] of [...migrateConfig]) {
 			try {
-				await this.setConfigCore(repoPath, key, value, { file: gkConfigPath });
+				await this._gkConfigWrites.run(gkConfigPath, undefined, () =>
+					this.setConfigCore(repoPath, key, value, { file: gkConfigPath }),
+				);
 			} catch (ex) {
 				scope?.error(ex, `Failed to migrate key '${key}' to GK config`);
 				// If we failed to migrate, delete it from the list so we won't try to remove it from git config later

@@ -5,6 +5,7 @@ import { toCloudIntegrationType } from '../authentication/models.js';
 import type { IntegrationIds } from '../constants.js';
 import { GitSelfManagedHostIntegrationId, IssuesSelfManagedHostIntegrationId } from '../constants.js';
 import { createIntegrationManager } from '../index.js';
+import { azureRestDiscoveryResponse } from '../providers/azure/__tests__/fixtures.js';
 import { createFakeRuntime } from './fakeRuntime.js';
 
 const providers = [
@@ -42,10 +43,13 @@ function providerResponse(id: IntegrationIds, url: URL): Response {
 		}
 		if (url.pathname.endsWith('/repositories/repo') || url.pathname.endsWith('/repositories/%252e')) {
 			const name = url.pathname.endsWith('/repositories/%252e') ? '%2e' : 'repo';
+			// Answer with the project the request addressed, as the server does.
+			const segments = url.pathname.split('/');
+			const project = decodeURIComponent(segments[segments.indexOf('_apis') - 1]);
 			return json({
 				id: '1',
 				name: name,
-				project: { id: 'project', name: 'project' },
+				project: { id: project, name: project },
 				remoteUrl: `${url.origin}/repo`,
 				_links: { web: { href: `${url.origin}/repo` } },
 			});
@@ -117,6 +121,9 @@ function createServer(id: IntegrationIds, baseUrl: string) {
 						},
 		});
 	runtime.http.fetch = async (input, init) => {
+		const discovery = azureRestDiscoveryResponse(input);
+		if (discovery != null) return discovery;
+
 		const url = new URL(input);
 		requests.push({
 			url: url,
@@ -658,6 +665,85 @@ suite('self-managed installation addresses through the public manager', () => {
 		}
 	});
 
+	test('Azure resolves a repository named after its project below an address naming the collection', async () => {
+		const id = GitSelfManagedHostIntegrationId.AzureDevOpsServer;
+		for (const path of ['/tfs', '']) {
+			const server = createServer(id, `https://server.test${path}/DefaultCollection`);
+			const manager = server.createManager();
+			try {
+				await manager.refreshConnections();
+				const [connection] = manager.getConfigured(id);
+				const remotes = [`https://server.test${path}/DefaultCollection/_git/repo`];
+				// An SSH remote isn't matched against the address; behind a virtual directory its project-less form is
+				// settled by the integration's collection discovery instead (see azureProjectlessRemotes.test.ts).
+				if (!path) {
+					remotes.push('ssh://git@server.test/DefaultCollection/_git/repo');
+				}
+				for (const remoteUrl of remotes) {
+					const count = server.requests.length;
+					const result = await manager.resolveRepository({ ...target(connection), remoteUrl: remoteUrl });
+					assert.equal(result.resolution.status, 'resolved', `${remoteUrl}: ${JSON.stringify(result)}`);
+					assert.equal(result.resolution.identity?.owner, 'DefaultCollection');
+					assert.equal(result.resolution.identity?.project, 'repo');
+					const paths = server.requests.slice(count).map(r => r.url.pathname);
+					assert.ok(
+						paths.includes(`${path}/DefaultCollection/repo/_apis/git/repositories/repo`),
+						`${remoteUrl}: ${paths.join(', ')}`,
+					);
+				}
+			} finally {
+				manager.dispose();
+			}
+		}
+	});
+
+	test('Azure re-bases an encoded _git marker below an address naming the collection', async () => {
+		const id = GitSelfManagedHostIntegrationId.AzureDevOpsServer;
+		const server = createServer(id, 'https://server.test/tfs/DefaultCollection');
+		const manager = server.createManager();
+		try {
+			await manager.refreshConnections();
+			const [connection] = manager.getConfigured(id);
+			const count = server.requests.length;
+			const result = await manager.resolveRepository({
+				...target(connection),
+				remoteUrl: 'https://server.test/tfs/DefaultCollection/project/%5Fgit/repo',
+			});
+			assert.equal(result.resolution.status, 'resolved', JSON.stringify(result));
+			assert.equal(result.resolution.identity?.owner, 'DefaultCollection');
+			assert.equal(result.resolution.identity?.project, 'project');
+			const paths = server.requests.slice(count).map(r => r.url.pathname);
+			assert.ok(paths.includes('/tfs/DefaultCollection/project/_apis/git/repositories/repo'), paths.join(', '));
+		} finally {
+			manager.dispose();
+		}
+	});
+
+	test('Azure leaves a project-less path below an installation address to the integration', async () => {
+		// `{collection}/_git/{repo}` relative to `/tfs` reads as a collection only when `/tfs` is the installation, which
+		// the address can't tell from a collection named `tfs`: matching keeps the full-path reading, and the
+		// integration settles it against the collections it discovers (none here), so the read addresses the parsed
+		// collection and project. This fake answers any repository path; a real server refuses that one, which
+		// azureProjectlessRemotes.test.ts covers.
+		const id = GitSelfManagedHostIntegrationId.AzureDevOpsServer;
+		const server = createServer(id, 'https://server.test/tfs');
+		const manager = server.createManager();
+		try {
+			await manager.refreshConnections();
+			const [connection] = manager.getConfigured(id);
+			const count = server.requests.length;
+			const result = await manager.resolveRepository({
+				...target(connection),
+				remoteUrl: 'https://server.test/tfs/DefaultCollection/_git/repo',
+			});
+			const paths = server.requests.slice(count).map(r => r.url.pathname);
+			assert.ok(paths.includes('/tfs/DefaultCollection/_apis/git/repositories/repo'), paths.join(', '));
+			assert.ok(!paths.some(p => p.includes('/DefaultCollection/repo/')), paths.join(', '));
+		} finally {
+			manager.dispose();
+		}
+	});
+
 	test('Azure matches installation paths decoded and case-insensitively', async () => {
 		const id = GitSelfManagedHostIntegrationId.AzureDevOpsServer;
 		const server = createServer(id, 'https://server.test/tfs/DefaultCollection');
@@ -729,7 +815,11 @@ suite('self-managed installation addresses through the public manager', () => {
 				targets: [{ key: 'a', owner: 'DefaultCollection', repo: 'repo', number: 7, project: 'project' }],
 			});
 			const paths = server.requests.slice(count).map(r => r.url.pathname);
-			assert.deepEqual(paths, ['/tfs/DefaultCollection/project/_apis/wit/workitems/7']);
+			// The collection's own connection data, which the row's `viewer` is read from (gitkraken/kepler#4291).
+			assert.deepEqual(paths.sort(), [
+				'/tfs/DefaultCollection/_apis/connectionData',
+				'/tfs/DefaultCollection/project/_apis/wit/workitems/7',
+			]);
 		} finally {
 			manager.dispose();
 		}

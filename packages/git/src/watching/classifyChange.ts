@@ -1,7 +1,33 @@
 import type { RepositoryChange } from '../models/repository.js';
 
+/**
+ * Everything a `.git` watcher can report. Used when events were lost (`overflow`), so every cache type those
+ * kinds clear is refreshed. Deliberately not `'unknown'`: `Cache.onRepositoryChanged` treats that as a close and
+ * unregisters the path, after which shared evictions stop reaching it.
+ */
+export const allWatchedRepositoryChanges: readonly RepositoryChange[] = [
+	'index',
+	'head',
+	'heads',
+	'tags',
+	'stash',
+	'remotes',
+	'worktrees',
+	'worktreeHead',
+	'config',
+	'cherryPick',
+	'merge',
+	'rebase',
+	'revert',
+	'pausedOp',
+	'ignores',
+	'gkConfig',
+];
+
 const classifyRegex =
-	/(worktrees|index|HEAD|FETCH_HEAD|ORIG_HEAD|CHERRY_PICK_HEAD|MERGE_HEAD|REBASE_HEAD|rebase-merge|rebase-apply|sequencer|REVERT_HEAD|config|gk\/config|info\/exclude|refs\/(?:heads|remotes|stash|tags|replace)|packed-refs|shallow)/;
+	/(index|HEAD|FETCH_HEAD|ORIG_HEAD|CHERRY_PICK_HEAD|MERGE_HEAD|REBASE_HEAD|rebase-merge|rebase-apply|sequencer|REVERT_HEAD|config|gk\/config|info\/exclude|refs\/(?:heads|remotes|stash|tags|replace)|packed-refs|shallow)/;
+/** A ref, ref directory or ref lock in a namespace {@link classifyRegex} maps; of the locks, only the stash's counts */
+const watchedRefRegex = /^refs\/(?:heads|remotes|stash|tags|replace)(?:\/|\.lock$|$)/;
 
 /**
  * Maps a path relative to a `.git` directory to the corresponding
@@ -9,8 +35,14 @@ const classifyRegex =
  * regex and switch table encode which files in `.git/` correspond
  * to which logical repository changes.
  *
- * @param relativePath - Path relative to the `.git` directory
- *   (e.g., `refs/heads/main`, `HEAD`, `config`)
+ * `worktrees` means the worktree list, or what `git worktree list` reports per worktree, changed:
+ * `worktrees`, `worktrees/<n>` (add/remove/prune) and `worktrees/<n>/{HEAD,locked,gitdir}`. `worktrees/<n>/HEAD`
+ * is also `worktreeHead`: that worktree's HEAD moved, which can change what any worktree's git reads answer, where
+ * the rest changes only the list. Any other path under `worktrees/<n>/` (index, `*_HEAD`, `MERGE_*`, rebase state,
+ * logs, …) is that worktree's own state, which its own gitdir watcher classifies, so it yields `undefined` here.
+ *
+ * @param relativePath - Path relative to the common `.git` directory or a worktree's gitdir
+ *   (e.g., `refs/heads/main`, `HEAD`, `config`, `worktrees/foo/HEAD`)
  * @returns An array of change types, or `undefined` if the path
  *   is noise or unrecognized. `undefined` for `FETCH_HEAD` which
  *   is intentionally not mapped to a change type (the extension
@@ -24,6 +56,33 @@ export function classifyGitDirChange(relativePath: string): RepositoryChange[] |
 	// in `rebase-merge/` and the directory itself.
 	if (relativePath.endsWith('/git-rebase-todo') || relativePath.endsWith('/git-rebase-todo.backup')) {
 		return undefined;
+	}
+
+	if (relativePath.startsWith('worktrees')) {
+		if (relativePath.length === 9) return ['worktrees'];
+
+		if (relativePath.charCodeAt(9) === 47 /* / */) {
+			const idEnd = relativePath.indexOf('/', 10);
+			if (idEnd === -1) return relativePath.length > 10 ? ['worktrees'] : undefined;
+
+			const file = relativePath.substring(idEnd + 1);
+			if (file === 'HEAD') return ['worktrees', 'worktreeHead'];
+
+			return file === 'locked' || file === 'gitdir' ? ['worktrees'] : undefined;
+		}
+	}
+
+	// A ref outside the namespaces core reads (a tool's own, such as `refs/undo/*`) is no change, whatever words its
+	// name holds: `refs/kepler/x/fix-index` must not read as the index
+	if (relativePath.startsWith('refs/')) {
+		if (!watchedRefRegex.test(relativePath)) return undefined;
+
+		// A ref's lock file is no change of the ref (no ref name ends in `.lock`): git renames it over the ref, which
+		// reports the ref itself, or removes it with the ref unchanged, as every fetch does with
+		// `refs/remotes/<remote>/HEAD` to check the remote's default branch. Except the stash's: its entries are its
+		// reflog (`logs/`, unwatched), which `git reflog expire` (as `gc` runs it) and `git reflog delete` rewrite under
+		// that lock alone
+		if (relativePath.endsWith('.lock') && relativePath !== 'refs/stash.lock') return undefined;
 	}
 
 	const match = classifyRegex.exec(relativePath);
@@ -100,9 +159,6 @@ export function classifyGitDirChange(relativePath: string): RepositoryChange[] |
 		// is deliberately broad: it can add, remove, or move refs of any of these types.
 		case 'packed-refs':
 			return ['heads', 'remotes', 'tags'];
-
-		case 'worktrees':
-			return ['worktrees'];
 
 		default:
 			return undefined;

@@ -4,6 +4,7 @@ import type { IssueSorting } from '@gitlens/git/models/issue.js';
 import type { PullRequestSorting } from '@gitlens/git/models/pullRequest.js';
 import type { IntegrationIds } from './constants.js';
 import { isProviderUnreachableError } from './errors.js';
+import { UnexpectedResponseError } from './providers/providerErrors.js';
 
 export interface ConnectionStateChangeEvent {
 	key: string;
@@ -25,8 +26,42 @@ export interface ConnectionStateChangeEvent {
  * provider, scope or request may. NOT unsupported (these stay `'other'`): malformed or contradictory caller
  * input the caller fixes in the request itself (a duplicate batch key, invalid target numbers, an empty owner,
  * an unusable scope), incompleteness or omission warnings, and unclassified errors.
+ *
+ * `'unreadable-items'`: the provider returned items this read could not read (a Jira issue whose fields the SDK cannot
+ * parse), so it left them out and read everything else in the warning's {@link ProviderWarning.scope}. It still fails
+ * the read (`fetchFailed`), since those items are missing, but retrying returns the same gap. On the reads that publish
+ * it (an issue tracker's project reads) it never hides a read that was cut short: a cut always comes with a warning of
+ * another kind. {@link ProviderWarning.unreadableItems} names the items left out.
  */
-export type ProviderWarningKind = 'auth' | 'rate-limit' | 'not-found' | 'no-connection' | 'unsupported' | 'other';
+export type ProviderWarningKind =
+	| 'auth'
+	| 'rate-limit'
+	| 'not-found'
+	| 'no-connection'
+	| 'unsupported'
+	| 'unreadable-items'
+	| 'other';
+
+/** The items an `'unreadable-items'` warning left out: see {@link ProviderWarning.unreadableItems}. */
+export interface ProviderWarningUnreadableItems {
+	/**
+	 * The provider's identifiers of the items left out (a Jira issue's key), without duplicates, in reported order. Each
+	 * one is an item the provider reported as skipped, so an identifier present is one that was left out, and one absent
+	 * was read when {@link complete}.
+	 *
+	 * Both hold only for the spelling the provider returned, which is also how a published issue's id spells its key: `keys`
+	 * doesn't answer a lookup by another spelling, such as a different case or the key an issue had before it moved. A
+	 * consumer comparing a key from elsewhere (one parsed from a branch name, say) must normalize the case of both sides,
+	 * and can't take an issue under a key it once had as read.
+	 */
+	keys: string[];
+	/**
+	 * Whether {@link keys} names every item left out. `false` when an item left out had no key to report, when the
+	 * provider's report of them was malformed (no list of keys, or more than keys in it), or when it said items were left
+	 * out and named none, so an identifier absent from `keys` may still be one of them.
+	 */
+	complete: boolean;
+}
 
 /**
  * Why a read that SUCCEEDED still withheld results:
@@ -60,11 +95,25 @@ export interface ProviderWarningScope {
 	/**
 	 * The resource as the read addressed it: its id on most reads, its name on the few that address it by name
 	 * (Azure DevOps' repo-scoped reads, Bitbucket's workspace reads). Match it against both
-	 * `ProviderOrganization.id` and `name`.
+	 * `ProviderOrganization.id` and `name`, and a project's `orgId` where it has one.
 	 */
 	resourceId?: string;
+	/**
+	 * The project as the read addressed it. For a Jira project read, the key, on Jira Cloud and Jira Data Center alike
+	 * (the project's `name` in `listProjects`).
+	 */
 	projectId?: string;
 	repositoryId?: string;
+}
+
+/**
+ * The selector of an issue-tracker project read that matched nothing: see {@link ProviderWarning.selector}. `kind`
+ * names which one missed, and `value` is that selector exactly as the caller passed it. `linearProject` is one of a
+ * Linear read's `linearProjects`, an id the workspace's Projects no longer list.
+ */
+export interface ProviderWarningSelector {
+	kind: 'org' | 'project' | 'linearProject';
+	value: string;
 }
 
 /**
@@ -79,6 +128,10 @@ export interface ProviderWarningScope {
  *   permission). Someone who administers it has to grant access.
  * - `conditional-access`: a Microsoft Entra Conditional Access policy blocked the request (Azure DevOps
  *   `VS403463`). Its admin has to exempt the request, e.g. by location or device.
+ * - `unexpected-response`: the provider answered, but not with data in the shape the read expects (a gateway's JSON
+ *   error on a 2xx, an empty object, `null`), so the read could not use it. Accompanies `kind: 'other'`, like
+ *   `unreachable`; a retry may succeed once the provider, or whatever answered in front of it, answers properly. A
+ *   page served instead of data keeps its own message, without this cause.
  *
  * None of these is healed by reconnecting, which is the point of naming them.
  */
@@ -86,7 +139,8 @@ export type ProviderWarningCauseReason =
 	| 'oauth-app-not-allowed'
 	| 'access-denied'
 	| 'conditional-access'
-	| 'unreachable';
+	| 'unreachable'
+	| 'unexpected-response';
 
 /** See {@link ProviderWarning.cause}. */
 export interface ProviderWarningCause {
@@ -182,8 +236,9 @@ export interface ProviderWarning {
 	 * Why the provider request failed, when the failure itself says so: see {@link ProviderWarningCauseReason}. Switch on
 	 * `reason` to recommend a fix instead of a reconnect; `message` then carries the same explanation as prose.
 	 *
-	 * `unreachable` accompanies a transport or server failure with `kind: 'other'`. Credential refusal causes are
-	 * set only on a scoped `auth` warning whose credential was confirmed first (see {@link scope}), because the
+	 * `unreachable` accompanies a transport or server failure with `kind: 'other'`, and `unexpected-response` a response
+	 * the read could not use, also with `kind: 'other'`. Credential refusal causes are set only on a scoped `auth`
+	 * warning whose credential was confirmed first (see {@link scope}), because the
 	 * refusals they name are indistinguishable from a dead credential until then: Azure DevOps answers a
 	 * third-party OAuth app its organization disallows exactly as it answers an expired token. Only Azure DevOps
 	 * reports one today. Its absence proves nothing about the cause.
@@ -212,6 +267,46 @@ export interface ProviderWarning {
 	 * out, so treat a bare `kind: 'other'` warning as unclassified rather than as a proven failure.
 	 */
 	omission?: ProviderWarningOmission;
+	/**
+	 * Present exactly when {@link kind} is `'unreadable-items'`: which items the read left out because it could not read
+	 * them. A consumer deciding whether an identifier is absent from the provider, rather than merely unread, must find
+	 * it in no warning's `keys` and see `complete` on every one.
+	 */
+	unreadableItems?: ProviderWarningUnreadableItems;
+	/**
+	 * Present when an issue-tracker project read's `org` or `project` selector matched nothing the connection
+	 * discovered: the selection was removed, renamed, or is no longer visible to this connection. `kind` is
+	 * `'not-found'`, the page is empty and not `fetchFailed`, and it carries no cursor, since a retry finds the same.
+	 * A `linearProject` miss is diagnostic: the requested Project ids still filter the read, preserving issues in
+	 * other selected Projects. It therefore does not force an empty page or remove its continuation.
+	 *
+	 * Set only when discovery was complete. A read whose discovery failed or was truncated cannot tell a missing
+	 * selection from one it did not reach, so it keeps reporting that failure instead, without this field. A miss is
+	 * confirmed against the connection's lists as the provider holds them now, read without the cache, since a cached
+	 * one predates what was created since. A cached project list can still name a project deleted since: the tracker
+	 * refuses it (Jira's "does not exist for the field 'project'"), it reads as empty, and the refusal drops that list,
+	 * so the next read reports the miss. Jira Data Center's refusal counts only when it names the user it
+	 * authenticated: it answers a rejected token the same way, as the anonymous user. The miss waits on an account
+	 * lookup on a resource those lists name, which confirms the
+	 * connection's credential, and a failed lookup is reported as the read's failure instead; an account that lists no
+	 * resource at all has none to look up, and is judged on its lists alone.
+	 *
+	 * It is the discriminant: a `not-found` without it is a request that failed with a 404, 410 or 422.
+	 */
+	selector?: ProviderWarningSelector;
+	/**
+	 * The keys of the batch targets this warning concerns: the target a per-target failure was refused or failed
+	 * for, or every target of an integration call that failed as a whole. So a caller that sends several callers'
+	 * targets in one call can hand a failure only to the targets it belongs to.
+	 *
+	 * Its ABSENCE means the whole call. It is absent on every read that is not a batch read, and on a batch read's
+	 * refusal of the whole call before any target is read (a duplicate key, an invalid target, an unknown etag
+	 * include, no resolvable connection, the wrong surface), which concerns every target alike.
+	 *
+	 * It is not part of a warning's identity: two warnings that differ only here are one warning, for the union of
+	 * their targets (see {@link appendDedupedWarning}).
+	 */
+	targetKeys?: string[];
 }
 
 export interface ProviderPageInfo {
@@ -284,6 +379,13 @@ export interface ProviderResult<T> {
 }
 
 export interface ProviderPagedResult<T> extends ProviderResult<T> {
+	/**
+	 * True when a request failed. Unlike `fetchFailed`, a collection read successfully that only left some of its items
+	 * unreadable doesn't set it; those items are named by their own warnings.
+	 */
+	requestFailed?: boolean;
+	/** True when the provider advertised continuation without a usable cursor or page position, or repeated one. */
+	unexpectedGap?: boolean;
 	page: ProviderPageInfo;
 	hasMore: boolean;
 	/**
@@ -295,22 +397,43 @@ export interface ProviderPagedResult<T> extends ProviderResult<T> {
 	cursor?: string;
 }
 
+/**
+ * One sweep target, named the way {@link ProviderSweepTargetEvent} names it, so a consumer can join the two.
+ * `domain` is the resolved self-managed host (always `undefined` for a cloud provider).
+ */
+export interface ProviderSweepTargetRef {
+	providerId: IntegrationIds;
+	connectionId: string | undefined;
+	domain: string | undefined;
+}
+
+/**
+ * A sweep may carry several targets of one provider (one per connection), so the provider arrays below can't say
+ * which connection failed: `failedTargets` and `incompleteTargets` are the authoritative attribution, and
+ * `failedProviderIds`/`incompleteProviderIds` summarize them. With one target per provider the two agree exactly.
+ */
 export interface ProviderSweepResult<T> extends ProviderResult<T> {
 	page: ProviderPageInfo;
 	hasMore: boolean;
 	/**
-	 * Providers whose top-level read failed before returning any usable page. Partial per-scope failures stay
-	 * represented by `warnings` + `fetchFailed` and are intentionally excluded.
+	 * Providers whose top-level read failed before returning any usable page, for EVERY attributed target of the
+	 * provider. A provider with a failed target and a surviving sibling is in `incompleteProviderIds` instead.
+	 * Partial per-scope failures stay represented by `warnings` + `fetchFailed` and are intentionally excluded.
 	 */
 	failedProviderIds: IntegrationIds[];
 	/**
 	 * Providers whose read started successfully but could not produce an authoritative complete slice (for
-	 * example, a later page failed, collection metadata reported a partial scope, or a paging backstop was hit).
+	 * example, a later page failed, collection metadata reported a partial scope, or a paging backstop was hit),
+	 * or that have a failed target beside one that returned something.
 	 * Kept separate from
 	 * `failedProviderIds` so consumers can accept healthy sibling providers while preserving an older snapshot
 	 * for a provider whose returned slice has a gap.
 	 */
 	incompleteProviderIds: IntegrationIds[];
+	/** Targets whose top-level read failed before returning any usable page. A skipped target is in neither list. */
+	failedTargets: ProviderSweepTargetRef[];
+	/** Targets that returned a slice with a gap: a later page failed, or pages remain unread. Never also in `failedTargets`. */
+	incompleteTargets: ProviderSweepTargetRef[];
 }
 
 export interface ProviderBroadenResult<T> extends ProviderPagedResult<T> {
@@ -388,13 +511,33 @@ export function providerWarningMessage(ex: unknown): string {
 
 /**
  * Normalized org/workspace/group shape returned by the provider facade.
- * `name` is the provider identifier to pass to follow-up reads, while `org` is an optional display label.
+ * `name` is the provider identifier to pass to follow-up reads (a Jira project's key), while `org` is an optional
+ * display label of the parent. Where that label can't address the parent, `orgId` is the parent's stable id to pass
+ * as `org` instead (a Jira site's id, or a Data Center instance's domain).
+ *
+ * Jira site rows (`listOrgs`) are the exception: their `name` is the site's label, and a Jira read selects a site only
+ * by its `id` (or a project row's `orgId`).
  */
 export interface ProviderOrganization {
 	id: string;
 	providerId: IntegrationIds;
 	name: string;
 	org?: string;
+	orgId?: string;
+	url: string;
+}
+
+/**
+ * A Linear Project (Linear's own `Project` entity, which can span several teams), as `listLinearProjects` lists it.
+ * Distinct from the teams `listProjects` publishes for Linear: pass its `id` to `listIssueTrackerIssuesPage`'s
+ * `linearProjects` to narrow an issue read to it.
+ */
+export interface ProviderLinearProjectShape {
+	id: string;
+	providerId: IntegrationIds;
+	name: string;
+	/** Linear's project state, as Linear names it (e.g. `planned`, `started`, `paused`, `completed`, `canceled`). */
+	state: string;
 	url: string;
 }
 
@@ -439,6 +582,7 @@ export function toProviderWarning(
 		kind = 'other';
 	}
 
+	const cause = kind === 'other' ? getRequestFailureCause(ex) : undefined;
 	return {
 		providerId: providerId,
 		domain: domain,
@@ -446,8 +590,18 @@ export function toProviderWarning(
 		message: providerWarningMessage(ex),
 		kind: kind,
 		isAuth: kind === 'auth',
-		...(kind === 'other' && isProviderUnreachableError(ex) ? { cause: { reason: 'unreachable' as const } } : {}),
+		...(cause != null ? { cause: cause } : {}),
 	};
+}
+
+/**
+ * The cause a failed request's error names by itself, one that isn't the credential's (`unexpected-response` or
+ * `unreachable`), for a failure classified as no more specific than that.
+ */
+export function getRequestFailureCause(ex: unknown): ProviderWarningCause | undefined {
+	if (UnexpectedResponseError.is(ex)) return { reason: 'unexpected-response' };
+	if (isProviderUnreachableError(ex)) return { reason: 'unreachable' };
+	return undefined;
 }
 
 /**
@@ -536,17 +690,66 @@ function providerWarningKey(warning: ProviderWarning): string {
 		collectionScopeKey(warning.scope),
 		warning.cause?.reason ?? '',
 		providerWarningOmissionKey(warning.omission),
+		warning.selector != null ? JSON.stringify([warning.selector.kind, warning.selector.value]) : '',
 		warning.message,
 	].join(' ');
 }
 
 /**
  * Appends `warning` to `into` only when an equal warning (by provider/connection/domain/kind/message, plus the
- * structured scope, cause and omission when present) is absent.
+ * structured scope, cause, omission and selector when present) is absent. An equal warning already there merges its
+ * {@link ProviderWarning.targetKeys} with the new one's instead: the union of both, or none when either concerns
+ * the whole call. Its {@link ProviderWarning.unreadableItems} merge too (see {@link mergeUnreadableItems}): two reads
+ * can report the same text for different items. The existing warning is replaced, never mutated, since it may be
+ * shared.
  */
 export function appendDedupedWarning(into: ProviderWarning[], warning: ProviderWarning): void {
 	const key = providerWarningKey(warning);
-	if (into.some(existing => providerWarningKey(existing) === key)) return;
+	const index = into.findIndex(existing => providerWarningKey(existing) === key);
+	if (index === -1) {
+		into.push(warning);
+		return;
+	}
 
-	into.push(warning);
+	const existing = into[index];
+	const targetKeys = mergeTargetKeys(existing.targetKeys, warning.targetKeys);
+	const unreadableItems =
+		existing.unreadableItems != null && warning.unreadableItems != null
+			? mergeUnreadableItems(existing.unreadableItems, warning.unreadableItems)
+			: (existing.unreadableItems ?? warning.unreadableItems);
+	if (targetKeys === existing.targetKeys && unreadableItems === existing.unreadableItems) return;
+
+	const { targetKeys: _, ...rest } = existing;
+	into[index] = {
+		...rest,
+		...(targetKeys != null ? { targetKeys: targetKeys } : {}),
+		...(unreadableItems != null ? { unreadableItems: unreadableItems } : {}),
+	};
+}
+
+/** The union of two warnings' target keys, or none when either concerns the whole call. `existing` when unchanged. */
+function mergeTargetKeys(existing: string[] | undefined, next: string[] | undefined): string[] | undefined {
+	// Either concerns the whole call.
+	if (existing == null || next == null) return undefined;
+
+	const added = next.filter(k => !existing.includes(k));
+	if (!added.length) return existing;
+
+	return [...existing, ...new Set(added)];
+}
+
+/**
+ * The items two reports of unreadable items left out together: the union of their keys, complete only when both are.
+ * `existing` when `next` adds nothing to it.
+ */
+export function mergeUnreadableItems(
+	existing: ProviderWarningUnreadableItems,
+	next: ProviderWarningUnreadableItems,
+): ProviderWarningUnreadableItems {
+	const known = new Set(existing.keys);
+	const added = next.keys.filter(k => !known.has(k));
+	const complete = existing.complete && next.complete;
+	if (!added.length && complete === existing.complete) return existing;
+
+	return { keys: [...existing.keys, ...new Set(added)], complete: complete };
 }

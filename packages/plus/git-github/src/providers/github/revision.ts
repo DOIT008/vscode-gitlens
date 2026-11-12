@@ -69,15 +69,22 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 	}
 
 	@debug()
-	async getTrackedFiles(repoPath: string): Promise<string[]> {
-		const tree = await this.getTreeForRevision(repoPath, 'HEAD');
+	async getTrackedFiles(repoPath: string, options?: { paths?: readonly string[] }): Promise<string[]> {
+		const tree = await this.getTreeForRevision(repoPath, 'HEAD', options);
 		return tree.filter(f => f.type === 'blob').map(f => f.path);
 	}
 
 	@gate()
 	@debug()
-	async getTreeForRevision(repoPath: string, rev: string): Promise<GitTreeEntry[]> {
+	async getTreeForRevision(
+		repoPath: string,
+		rev: string,
+		options?: { paths?: readonly string[] },
+	): Promise<GitTreeEntry[]> {
 		if (repoPath == null) return [];
+
+		const paths = options?.paths;
+		if (paths != null && !paths.length) return [];
 
 		if (rev === 'HEAD') {
 			const context = await this.provider.ensureRepositoryContext(repoPath);
@@ -96,6 +103,11 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 
 		const result: GitTreeEntry[] = [];
 		for (const [path, type] of entries) {
+			// Only the root is listed, so a scope keeps the entries on its way to it, and anything beneath it
+			if (paths != null && !paths.some(p => p === path || p.startsWith(`${path}/`) || path.startsWith(`${p}/`))) {
+				continue;
+			}
+
 			result.push({
 				ref: rev,
 				oid: '',
@@ -136,13 +148,28 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 
 		const { metadata, github, session } = context;
 
-		const sha = await github.resolveReference(
-			toTokenInfo(this.provider.authenticationProviderId, session),
-			metadata.repo.owner,
-			metadata.repo.name,
-			stripOrigin(ref),
-			relativePath,
-		);
+		const token = toTokenInfo(this.provider.authenticationProviderId, session);
+		const stripped = stripOrigin(ref);
+
+		let sha: string | undefined;
+		if (relativePath) {
+			const result = await github.resolveReferenceForPath(
+				token,
+				metadata.repo.owner,
+				metadata.repo.name,
+				stripped,
+				relativePath,
+			);
+
+			if (result != null && !result.exists) {
+				// Like the CLI provider, report a file missing at this ref as deleted; GitHub doesn't tell a rename away apart
+				return { sha: result.sha, revision: isRevisionWithSuffix(ref) ? result.sha : ref, status: 'D' };
+			}
+
+			sha = result?.sha;
+		} else {
+			sha = await github.resolveReference(token, metadata.repo.owner, metadata.repo.name, stripped);
+		}
 
 		if (sha == null) {
 			return { sha: relativePath ? deletedOrMissing : ref, revision: ref };

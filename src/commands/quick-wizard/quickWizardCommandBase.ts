@@ -317,6 +317,8 @@ export abstract class QuickWizardCommandBase extends GlCommandBase {
 					void scope.pause(['left', 'ctrl+left', 'right', 'ctrl+right']);
 				}
 
+				let accepting = false;
+
 				disposables.push(
 					scope,
 					input.onDidHide(() => {
@@ -377,7 +379,43 @@ export abstract class QuickWizardCommandBase extends GlCommandBase {
 						input.validationMessage = message;
 					}),
 					input.onDidAccept(async () => {
-						resolve(await this.nextStep(rootStep.command!, input.value, input));
+						if (accepting) return;
+
+						accepting = true;
+						try {
+							// Validate before advancing — the step re-validates on continue and breaks (going back a
+							// step and losing the typed value) when invalid, so an invalid value must keep the input open
+							if (step.validate != null) {
+								const value = input.value;
+								const validation = step.validate(value);
+								if (isPromise(validation)) {
+									input.busy = true;
+								}
+
+								let valid;
+								let message;
+								try {
+									[valid, message] = await validation;
+								} finally {
+									input.busy = false;
+								}
+
+								// Edited while validating — `onDidChangeValue` owns the message for the new value
+								if (input.value !== value) return;
+
+								if (!valid) {
+									input.validationMessage =
+										message != null
+											? { severity: InputBoxValidationSeverity.Error, message: message }
+											: undefined;
+									return;
+								}
+							}
+
+							resolve(await this.nextStep(rootStep.command!, input.value, input));
+						} finally {
+							accepting = false;
+						}
 					}),
 				);
 
@@ -791,32 +829,30 @@ export abstract class QuickWizardCommandBase extends GlCommandBase {
 									case Directive.Noop:
 										return;
 
-									case Directive.SignIn: {
-										const result = await Container.instance.subscription.loginOrSignUp(false, {
-											source: 'quick-wizard',
-											detail: {
-												action: rootStep.command?.key,
-												'step.title': step.title,
+									case Directive.SignIn:
+									case Directive.StartProTrial: {
+										// Signing in shows its own input box, which hides this quick pick; frozen, that hide
+										// doesn't end the wizard, so the retry below can carry it on. Its keys stay bound
+										// though, so Left in that input box would otherwise go back on the hidden step
+										using _frozen = step.freeze?.();
+										await scope.pause();
+										const result = await Container.instance.subscription.loginOrSignUp(
+											item.directive === Directive.StartProTrial,
+											{
+												source: 'quick-wizard',
+												detail: {
+													action: rootStep.command?.key,
+													'step.title': step.title,
+												},
 											},
-										});
+											{ openAccountView: false },
+										);
 										resolve(result ? await rootStep.command?.retry() : undefined);
 										return;
 									}
 
 									case Directive.RequiresVerification: {
 										const result = await Container.instance.subscription.resendVerification({
-											source: 'quick-wizard',
-											detail: {
-												action: rootStep.command?.key,
-												'step.title': step.title,
-											},
-										});
-										resolve(result ? await rootStep.command?.retry() : undefined);
-										return;
-									}
-
-									case Directive.StartProTrial: {
-										const result = await Container.instance.subscription.loginOrSignUp(true, {
 											source: 'quick-wizard',
 											detail: {
 												action: rootStep.command?.key,

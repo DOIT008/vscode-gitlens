@@ -21,6 +21,7 @@ import { iterateAsyncByDelimiter } from '@gitlens/utils/string.js';
 import type { Uri } from '@gitlens/utils/uri.js';
 import { toFsPath } from '@gitlens/utils/uri.js';
 import type { CliGitProviderInternal } from '../cliGitProvider.js';
+import type { GitResult } from '../exec/exec.types.js';
 import type { Git, GitError } from '../exec/git.js';
 import { getGitCommandError, gitConfigsBranch, gitConfigsLog } from '../exec/git.js';
 import { getReflogEntryParser } from '../parsers/reflogParser.js';
@@ -34,7 +35,7 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 		private readonly provider: CliGitProviderInternal,
 	) {}
 
-	@debug()
+	@debug({ quiet: true })
 	async checkIfCouldBeValidBranchOrTagName(repoPath: string, ref: string): Promise<boolean> {
 		try {
 			const result = await this.git.run({ cwd: repoPath, errors: 'throw' }, 'check-ref-format', '--branch', ref);
@@ -50,7 +51,7 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 	 * is `for-each-ref`-specific and intentionally absent from the public `GitRefsSubProvider`
 	 * interface.
 	 */
-	@debug()
+	@debug({ quiet: true })
 	async getRefs(repoPath: string, cancellation?: AbortSignal, options?: { force?: boolean }): Promise<RefRecord[]> {
 		if (!repoPath) return [];
 
@@ -121,7 +122,7 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 		);
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async getRefTips(
 		repoPath: string,
 		options?: { include?: ReadonlyArray<'heads' | 'remotes' | 'tags'> },
@@ -193,7 +194,7 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 		});
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async getRefsContainingShas(
 		repoPath: string,
 		shas: ReadonlySet<string> | readonly string[],
@@ -307,7 +308,7 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 		return result;
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async getMergeBase(
 		repoPath: string,
 		ref1: string,
@@ -344,7 +345,7 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 		}
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async getReflogEntries(
 		repoPath: string,
 		ref: string,
@@ -356,7 +357,8 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 		const parser = getReflogEntryParser();
 		const args = ['reflog', 'show', ...parser.arguments];
 		if (options?.grep) {
-			args.push(`--grep-reflog=${options.grep}`);
+			// A basic regex whatever the user's `grep.patternType`, which as `fixed` would match no pattern at all
+			args.push('--basic-regexp', `--grep-reflog=${options.grep}`);
 		}
 		args.push(ref, '--');
 
@@ -379,7 +381,7 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 		return entries;
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async getReference(
 		repoPath: string,
 		ref: string,
@@ -424,23 +426,52 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 		return createReference(ref, repoPath, { refType: 'revision' });
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async getSymbolicReferenceName(
 		repoPath: string,
 		ref: string,
 		options?: { priority?: GitCommandPriority },
 		cancellation?: AbortSignal,
 	): Promise<string | undefined> {
+		const result = await this.runSymbolicReferenceName(repoPath, ref, options, cancellation);
+		return result.stdout.trim() || undefined;
+	}
+
+	/**
+	 * Like {@link getSymbolicReferenceName}, but tells a ref git confirmed doesn't exist (`rev-parse --verify` exit 1)
+	 * apart from a read that didn't complete (timeout, error, cancellation), which never reports `missing`.
+	 * Shares the same cached `rev-parse`, though only a found ref is cached: a missing one re-runs on every call.
+	 */
+	@debug({ quiet: true })
+	async getSymbolicReferenceNameOrMissing(
+		repoPath: string,
+		ref: string,
+		options?: { priority?: GitCommandPriority },
+		cancellation?: AbortSignal,
+	): Promise<{ name: string | undefined; missing: boolean }> {
+		const result = await this.runSymbolicReferenceName(repoPath, ref, options, cancellation);
+		return {
+			name: result.stdout.trim() || undefined,
+			missing: result.completion.status === 'exited' && result.completion.code === 1,
+		};
+	}
+
+	private async runSymbolicReferenceName(
+		repoPath: string,
+		ref: string,
+		options?: { priority?: GitCommandPriority },
+		cancellation?: AbortSignal,
+	): Promise<GitResult> {
 		const supportsEndOfOptions = await this.git.supports('git:rev-parse:end-of-options');
 
-		const result = await this.git.run(
+		return this.git.run(
 			{
 				cwd: repoPath,
 				cancellation: cancellation,
 				errors: 'ignore',
-				// Why: a fixed ref name's symbolic name is itself stable; only HEAD is mutable, and the
-				// gitResults cache is cleared on 'head' events. 60s TTL is the failsafe for watcher
-				// latency / web — matches the other "resolve symbolic state" calls in commits.ts.
+				// Why: a fixed ref name's symbolic name is itself stable; only HEAD's, or whether the ref exists
+				// at all, changes — and the gitResults cache is cleared on those ref events. 60s TTL is the failsafe
+				// for watcher latency / web — matches the other "resolve symbolic state" calls in commits.ts.
 				caching: { cache: this.cache.gitResults, options: { accessTTL: 60 * 1000 } },
 				...(options?.priority != null ? { priority: options.priority } : undefined),
 			},
@@ -452,10 +483,9 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 			supportsEndOfOptions ? '--end-of-options' : undefined,
 			ref,
 		);
-		return result.stdout.trim() || undefined;
 	}
 
-	@debug({ args: repoPath => ({ repoPath: repoPath }) })
+	@debug({ quiet: true, args: repoPath => ({ repoPath: repoPath }) })
 	async hasBranchOrTag(
 		repoPath: string | undefined,
 		options?: {
@@ -477,7 +507,7 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 		return branches.length !== 0 || tags.length !== 0;
 	}
 
-	@debug()
+	@debug({ quiet: true })
 	async isValidReference(
 		repoPath: string,
 		ref: string,
@@ -491,7 +521,7 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 		);
 	}
 
-	@trace()
+	@trace({ quiet: true })
 	async validateReference(
 		repoPath: string,
 		ref: string,
@@ -603,17 +633,28 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 		}
 
 		if (branch != null) {
-			// What `git branch -d` removes itself (the upstream and other per-branch settings), then GitLens's own
-			await this.git.run({ cwd: repoPath, errors: 'ignore' }, 'config', '--remove-section', `branch.${branch}`);
-			await this.provider.branches.forgetDeletedBranch(repoPath, branch);
-			// A single combined reset/announce rather than this plus `fireReferenceChanged`'s own
-			// `'branches'`/`['heads']` — a branch delete only needs one of each.
-			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'config');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['heads']);
+			try {
+				// What `git branch -d` removes itself (the upstream and other per-branch settings), then GitLens's own
+				await this.git.run(
+					{ cwd: repoPath, errors: 'ignore' },
+					'config',
+					'--remove-section',
+					`branch.${branch}`,
+				);
+				await this.provider.branches.forgetDeletedBranch(repoPath, branch);
+			} finally {
+				// The ref is already gone, so announce even if the cleanup above fails. A single combined
+				// reset/announce rather than this plus `fireReferenceChanged`'s own `'branches'`/`['heads']` —
+				// a branch delete only needs one of each. The config change is the branch's own section.
+				this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'config');
+				this.context.hooks?.repository?.onChanged?.(repoPath, ['config', 'heads'], [ref], {
+					configConfinedToRefs: true,
+				});
+			}
 			return;
 		}
 
-		this.fireReferenceChanged(repoPath, ref);
+		this.fireReferenceChanged(repoPath, ref, false);
 	}
 
 	@debug()
@@ -657,11 +698,15 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 			);
 		}
 
-		this.fireReferenceChanged(repoPath, ref);
+		this.fireReferenceChanged(repoPath, ref, true);
 	}
 
-	/** Announces a ref mutation to the cache and repository hooks. */
-	private fireReferenceChanged(repoPath: string, ref: string): void {
+	/**
+	 * Announces a ref mutation to the cache and repository hooks. `deref` says git followed a symbolic `ref` (no
+	 * `--no-deref`), so a remote's `HEAD` moved the branch it points to and stays unnamed.
+	 */
+	private fireReferenceChanged(repoPath: string, ref: string, deref: boolean): void {
+		const refs = deref && ref.endsWith('/HEAD') ? undefined : [ref];
 		if (ref === 'HEAD') {
 			// `update-ref HEAD` moves whatever HEAD resolves to — the checked-out branch, or a detached HEAD
 			// — which also changes what the index and working tree are compared against.
@@ -669,21 +714,22 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads']);
 		} else if (ref.startsWith('refs/heads/')) {
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['heads']);
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['heads'], refs);
 		} else if (ref.startsWith('refs/tags/')) {
 			this.context.hooks?.cache?.onReset?.(repoPath, 'tags');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['tags']);
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['tags'], refs);
 		} else if (ref.startsWith('refs/remotes/')) {
 			// Remote-tracking branches are read through the branch and ref-tip caches, which `'branches'`
 			// clears; `'remotes'` covers only the configured remotes, which a ref write cannot change.
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['remotes']);
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['remotes'], refs);
 		} else if (ref === 'refs/stash') {
 			this.context.hooks?.cache?.onReset?.(repoPath, 'stashes');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['stash']);
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['stash'], refs);
 		}
-		// A ref outside those namespaces (a consumer's own bookkeeping under `refs/<tool>/`) is visible to
-		// nothing core caches, and announcing it as an unknown change would make a host refresh everything
-		// for a write it cannot observe.
+		// A ref outside those namespaces (a consumer's own bookkeeping under `refs/<tool>/`) is in no cached ref
+		// list, and announcing it as an unknown change would make a host refresh everything for it. Only a
+		// `git log --all` walk (graph, search, contributors) sees one, when it points at a commit, so a row it
+		// adds or drops can stay stale until the next heads change.
 	}
 }

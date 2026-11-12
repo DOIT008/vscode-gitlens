@@ -1,3 +1,4 @@
+import { trimTrailingSlashes } from '@gitlens/utils/path.js';
 import type { IssueEtagFields } from '../models/integration.js';
 import type { ProviderAccount, ProviderIssue, ProviderRequestFunction } from './models.js';
 
@@ -90,7 +91,7 @@ function toJiraIssueState(status: JiraIssueStatusResponse): NonNullable<Provider
 
 function toIssueWebUrl(resourceUrl: string, key: string): string {
 	const url = new URL(resourceUrl);
-	url.pathname = `${url.pathname.replace(/\/+$/, '')}/browse/${encodeURIComponent(key)}`;
+	url.pathname = `${trimTrailingSlashes(url.pathname)}/browse/${encodeURIComponent(key)}`;
 	url.search = '';
 	url.hash = '';
 	return url.toString();
@@ -214,10 +215,9 @@ export async function requestJiraIssuesEtagFields(
 
 /**
  * A bulk-fetched issue's change state, as the fields the full row's etag reads. {@link fromJiraIssueByKey} maps the
- * status with the same {@link toJiraIssueState} and never sets `closedDate`, so `toIssueShape` (with
- * `reliableStateCategory`) closes exactly the issues whose status category is done. Throws on a missing status or an
- * unparseable `updated`, so the target falls through to the full read rather than matching an etag that would ignore
- * its update time.
+ * status with the same {@link toJiraIssueState} and never sets `closedDate`, so `toIssueShape` closes exactly the
+ * issues whose status category is done. Throws on a missing status or an unparseable `updated`, so the target falls
+ * through to the full read rather than matching an etag that would ignore its update time.
  */
 export function toJiraIssueEtagFields(issue: JiraIssueEtagResponse): IssueEtagFields {
 	const { status, updated } = issue.fields;

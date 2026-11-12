@@ -1,4 +1,4 @@
-import type { CollectionMetadata } from '@gitkraken/provider-apis';
+import type { CollectionMetadata, CollectionScope } from '@gitkraken/provider-apis';
 import type { IssueShape, IssueSorting, IssueStateFilter } from '@gitlens/git/models/issue.js';
 import type { IssueFilter } from '../providerFilters.js';
 
@@ -103,6 +103,11 @@ export type IssuesForProjectOptions = {
 	 * (Trello) refuses anything but `'open'` rather than serving its open cards as if they were the closed ones.
 	 */
 	state?: IssueStateFilter;
+	/**
+	 * Linear only: narrows the read to issues in any of these Linear Projects (Linear's `Project` entity, by id),
+	 * server-side. Validated by the facade, which refuses it for any other tracker; omitted or empty adds nothing.
+	 */
+	linearProjects?: readonly string[];
 };
 
 /** One project of a batched tracker read (`IssuesIntegration.getIssuesForProjectsWithTruncationResult`). */
@@ -111,9 +116,23 @@ export type ProjectIssuesRequest<T> = {
 	options: IssuesForProjectOptions;
 };
 
+/** How a truncated project read could be recovered: see {@link ProjectIssuesDrain}. */
+export type ProjectIssuesRecovery = 'narrow-scope' | 'none';
+
+/**
+ * One project's issues as a tracker read them. A truncated result whose `metadata` reports a failure or an omission is
+ * explained by it; one whose metadata reports neither is a cut the facade reports for the project when it names its
+ * `scope` (Jira, whose drains record every other cut in their metadata), and for the read as a whole otherwise, where
+ * `narrow-scope` is not offered.
+ */
 export type ProjectIssuesDrain = {
 	values: IssueShape[];
 	metadata?: CollectionMetadata;
+	/**
+	 * The scope the provider records this project's failures under, so a cut the facade reports names the project
+	 * the same way: a Jira project by its key, on Cloud and Data Center alike. Omitted names no scope.
+	 */
+	scope?: CollectionScope;
 } & (
 	| { truncated: false }
 	| {
@@ -122,7 +141,7 @@ export type ProjectIssuesDrain = {
 			 * `narrow-scope` means a smaller server-side scope avoids this truncation. `none` covers incomplete
 			 * results without that guarantee, including Linear's client-side assignee filtering.
 			 */
-			recovery: 'narrow-scope' | 'none';
+			recovery: ProjectIssuesRecovery;
 	  }
 );
 
@@ -152,6 +171,12 @@ export type MyIssuesForReposOptions = {
 	 * that, because it is also the layer that can refuse a key no merge can honor.
 	 */
 	sort?: IssueSorting;
+	/**
+	 * Most per-repository requests (per-project for Azure DevOps) one provider read keeps in flight. Defaults to 6.
+	 * Only GitLab, GitLab self-managed and Azure DevOps fan out; GitHub/GHE send one query whatever the repo count.
+	 * A value that isn't a finite number >= 1 falls back to the default.
+	 */
+	scopeConcurrency?: number;
 };
 
 /**
@@ -192,8 +217,8 @@ export type SearchMyIssuesOptions = {
 	/**
 	 * Which issue states to read. Omitted reads open issues only.
 	 *
-	 * Honored by the issue trackers that declare `ProviderMetadata.supportsIssueStates` (Jira, Jira Data Center,
-	 * Linear). The git hosts' account-wide reads ignore it and keep their own open-only default.
+	 * Honored by providers declaring `ProviderMetadata.supportsIssueStates`, including Azure DevOps Services and
+	 * Server. Other git hosts keep their own open-only account-wide default.
 	 */
 	state?: IssueStateFilter;
 	/**

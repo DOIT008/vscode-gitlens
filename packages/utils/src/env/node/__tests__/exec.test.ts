@@ -1,6 +1,8 @@
 import * as assert from 'assert';
+import { spawn } from 'child_process';
 import * as process from 'process';
-import { CancelledRunError, run, RunError, runSpawn } from '../exec.js';
+import type { ProcessSpawner } from '../exec.js';
+import { CancelledRunError, run, RunError, runSpawn, spawnProcess } from '../exec.js';
 
 // Far past any OS pipe buffer, so the write is still in flight when the child goes away
 const largeInput = Buffer.alloc(32 * 1024 * 1024, 'x');
@@ -59,5 +61,113 @@ suite('Exec cancellation reason Test Suite', () => {
 		const promise = runSpawn(process.execPath, runsLong, 'utf8', { cancellation: controller.signal });
 		setTimeout(() => controller.abort(), 50);
 		await assert.rejects(promise, (ex: unknown) => ex instanceof CancelledRunError && ex.reason === 'aborted');
+	});
+});
+
+suite('runSpawn spawner Test Suite', () => {
+	test('runSpawn launches through an injected spawner with only the process options', async () => {
+		const calls: { command: string; args: readonly string[]; options: Record<string, unknown> }[] = [];
+		const spawner: ProcessSpawner = (command, args, options) => {
+			calls.push({ command: command, args: args, options: { ...options } });
+			return spawn(command, args, options);
+		};
+
+		const args = ['-e', `process.stdout.write('hi')`];
+		const direct = await runSpawn<string>(process.execPath, args, 'utf8', {});
+		const result = await runSpawn<string>(process.execPath, args, 'utf8', {
+			cwd: process.cwd(),
+			timeout: 10000,
+			maxBuffer: 1024,
+			quiet: true,
+			spawn: spawner,
+		});
+
+		assert.strictEqual(calls.length, 1);
+		assert.strictEqual(calls[0].command, process.execPath);
+		assert.deepStrictEqual(calls[0].args, args);
+		assert.deepStrictEqual(Object.keys(calls[0].options).sort(), ['cwd', 'env', 'signal', 'stdio', 'timeout']);
+		assert.strictEqual(result.stdout, direct.stdout);
+		assert.strictEqual(result.exitCode, direct.exitCode);
+	});
+
+	test('runSpawn hands the spawner no timeout for 0 and the given timeout otherwise', async () => {
+		const timeouts: (number | undefined)[] = [];
+		const spawner: ProcessSpawner = (command, args, options) => {
+			timeouts.push(options.timeout);
+			return spawn(command, args, options);
+		};
+		const args = ['-e', `process.stdout.write('hi')`];
+
+		await runSpawn<string>(process.execPath, args, 'utf8', { timeout: 0, spawn: spawner });
+		await runSpawn<string>(process.execPath, args, 'utf8', { timeout: 500, spawn: spawner });
+
+		assert.deepStrictEqual(timeouts, [undefined, 500]);
+	});
+
+	test('runSpawn rejects, rather than reading no output as empty, when the spawner pipes no stdout', async () => {
+		const spawner: ProcessSpawner = (command, args, options) =>
+			spawn(command, args, { ...options, stdio: ['ignore', 'ignore', 'ignore'] });
+
+		await assert.rejects(
+			runSpawn<string>(process.execPath, ['-e', `process.stdout.write('hi')`], 'utf8', { spawn: spawner }),
+			(ex: unknown) => ex instanceof Error && !(ex instanceof RunError),
+		);
+	});
+});
+
+async function countTimers(): Promise<number> {
+	// Mocha arms its own test timer only once the test returns its promise, so count after yielding to it. Callers
+	// assert no MORE timers than before: an earlier test's timer may fire in between, but a leak only ever adds one
+	await Promise.resolve();
+	return process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
+}
+
+function settled(proc: ReturnType<typeof spawnProcess>): Promise<void> {
+	return new Promise(resolve => {
+		proc.once('error', () => {});
+		proc.once('close', () => resolve());
+	});
+}
+
+suite('spawnProcess Test Suite', () => {
+	test('spawnProcess leaves no timeout timer behind when the launch fails', async () => {
+		const before = await countTimers();
+		// A missing `cwd` fails the launch (ENOENT), which emits `'error'` and `'close'` but never `'exit'`
+		const proc = spawnProcess(process.execPath, ['-e', ''], {
+			cwd: `${process.cwd()}/missing-cwd-${Date.now()}`,
+			timeout: 30000,
+		});
+		await settled(proc);
+
+		assert.ok((await countTimers()) <= before, 'a timeout timer outlived the process');
+	});
+
+	test('spawnProcess clears its timeout timer once the process exits', async () => {
+		const before = await countTimers();
+		const proc = spawnProcess(process.execPath, ['-e', ''], { timeout: 30000 });
+		await settled(proc);
+
+		assert.strictEqual(proc.exitCode, 0);
+		assert.ok((await countTimers()) <= before, 'a timeout timer outlived the process');
+	});
+
+	test('spawnProcess throws, before spawning, on a timeout Node would reject', () => {
+		for (const timeout of [1.5, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+			assert.throws(
+				() => spawnProcess(process.execPath, ['-e', ''], { timeout: timeout }),
+				(ex: unknown) =>
+					ex instanceof RangeError && (ex as RangeError & { code?: string }).code === 'ERR_OUT_OF_RANGE',
+			);
+		}
+	});
+
+	test('runSpawn rejects a timeout Node would reject', async () => {
+		for (const timeout of [1.5, -1]) {
+			await assert.rejects(
+				runSpawn(process.execPath, ['-e', ''], 'utf8', { timeout: timeout }),
+				(ex: unknown) =>
+					ex instanceof RangeError && (ex as RangeError & { code?: string }).code === 'ERR_OUT_OF_RANGE',
+			);
+		}
 	});
 });

@@ -1,5 +1,4 @@
 import type { CollectionMetadata, CollectionScopeFailure, GitIssueState } from '@gitkraken/provider-apis';
-import * as l10n from '@vscode/l10n';
 import type { Account } from '@gitlens/git/models/author.js';
 import type { AutolinkReference, DynamicAutolinkReference } from '@gitlens/git/models/autolink.js';
 import type { Issue, IssueShape } from '@gitlens/git/models/issue.js';
@@ -7,16 +6,19 @@ import type { IssueOrPullRequest, IssueOrPullRequestType } from '@gitlens/git/mo
 import type { IssueResourceDescriptor, ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
 import { isIssueResourceDescriptor } from '@gitlens/git/utils/resourceDescriptor.utils.js';
 import { chunk } from '@gitlens/utils/array.js';
+import { trace } from '@gitlens/utils/decorators/log.js';
 import { Logger } from '@gitlens/utils/logger.js';
+import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { mapSettledBounded } from '@gitlens/utils/promise.js';
 import { PromiseCache } from '@gitlens/utils/promiseCache.js';
 import type { IntegrationAuthenticationProviderDescriptor } from '../authentication/integrationAuthenticationProvider.js';
-import type { ProviderAuthenticationSession } from '../authentication/models.js';
+import type { ConnectionResource, ProviderAuthenticationSession } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
 import { toCollectionScopeFailure } from '../collectionMetadata.js';
 import { IssuesCloudHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
-import { IntegrationReadUnavailableError } from '../errors.js';
-import type { IssueEtagFields } from '../models/integration.js';
+import { IntegrationReadUnavailableError, toError } from '../errors.js';
+import type { IntegrationResult, IssueEtagFields } from '../models/integration.js';
+import { isReadSessionFailure } from '../models/integration.js';
 import type {
 	AccountWideIssuesResult,
 	IssuesForProjectOptions,
@@ -29,12 +31,19 @@ import {
 	IssuesIntegration,
 	splitProjectIssuesSearch,
 } from '../models/issuesIntegration.js';
+import { IssueFilter } from '../providerFilters.js';
 import type { LinearIssueEtagNode } from './linearIssuesEtag.js';
 import { linearIssuesEtagMaxNumbers, toLinearIssueEtagFields } from './linearIssuesEtag.js';
-import type { ProviderApiCollectionResult, ProviderIssue } from './models.js';
+import type {
+	ProviderApiCollectionResult,
+	ProviderHierarchyResult,
+	ProviderIssue,
+	ProviderLinearProject,
+} from './models.js';
 import { fromProviderIssue, providersMetadata, toIssueShape, toProviderIssueStates } from './models.js';
 import { DiscoveryCache, discoveryCacheTtl } from './utils/discoveryCache.js';
-import { mergeCollectionMetadata } from './utils/providerPaging.js';
+import { createIssueAutolinkReferences } from './utils/issueAutolinks.js';
+import { collectProviderPagedResult, mergeCollectionMetadata } from './utils/providerPaging.js';
 
 const metadata = providersMetadata[IssuesCloudHostIntegrationId.Linear];
 const authProvider = Object.freeze({ id: metadata.id, scopes: metadata.scopes });
@@ -55,6 +64,10 @@ const maxPagesPerRequest = 10;
  */
 const maxAccountWidePagesPerRequest = 50;
 const linearImplicitTeamsPageSize = 50;
+/** The workspace Projects read's backstop: provider-apis pages them 100 at a time, so 2,000 Projects. */
+const maxWorkspaceProjectPages = 20;
+/** Long enough to span one tracker read, short enough that a profile change shows on the next. */
+const recentAccountTTL = 60 * 1000;
 /** A team key and issue number, as Linear writes an issue's identifier (`ENG-123`). */
 const linearIdentifier = /^([A-Za-z0-9]+)-(\d+)$/;
 
@@ -67,6 +80,23 @@ export interface LinearOrganizationDescriptor extends IssueResourceDescriptor {
 }
 
 export interface LinearProjectDescriptor extends IssueResourceDescriptor {}
+
+/** The part of a team read's filter that narrows it to the viewer. */
+type LinearViewerScope = { assignees: string[]; githubSyncedCreators?: string[] };
+
+/**
+ * How a user-scoped team read narrows to the viewer: the issues assigned to them, plus, unless the caller asked for
+ * assigned issues by name, the GitHub-synced issues they created. Linear's GitHub Issues sync makes the GitHub author
+ * of an issue (one who linked their GitHub account) the creator of its Linear copy but assigns no one GitHub doesn't,
+ * so an assignee-only read never returns the copy of a GitHub issue the user filed (gitkraken/kepler#4480). Only
+ * synced issues widen, and only those the viewer created on either side: the rest of what the user created in Linear
+ * stays out of "my issues", as does a synced issue they merely follow.
+ */
+function viewerScope(viewerId: string, filters: IssueFilter[] | undefined): LinearViewerScope {
+	return filters?.includes(IssueFilter.Assignee)
+		? { assignees: [viewerId] }
+		: { assignees: [viewerId], githubSyncedCreators: [viewerId] };
+}
 
 export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrationId.Linear> {
 	/**
@@ -123,32 +153,9 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 
 		const teams = await this.getTeams(session);
 		for (const team of teams ?? []) {
-			const dashedPrefix = `${team.key}-`;
-			const underscoredPrefix = `${team.key}_`;
-
-			autolinks.push({
-				prefix: dashedPrefix,
-				url: `${organization.url}/issue/${dashedPrefix}<num>`,
-				alphanumeric: false,
-				ignoreCase: false,
-				title: l10n.t('Open Issue {0} on {1}', `${dashedPrefix}<num>`, organization.name),
-
-				type: 'issue',
-				description: l10n.t('{0} Issue {1}', organization.name, `${dashedPrefix}<num>`),
-				descriptor: { ...organization },
-			});
-			autolinks.push({
-				prefix: underscoredPrefix,
-				url: `${organization.url}/issue/${dashedPrefix}<num>`,
-				alphanumeric: false,
-				ignoreCase: false,
-				referenceType: 'branch',
-				title: l10n.t('Open Issue {0} on {1}', `${dashedPrefix}<num>`, organization.name),
-
-				type: 'issue',
-				description: l10n.t('{0} Issue {1}', organization.name, `${dashedPrefix}<num>`),
-				descriptor: { ...organization },
-			});
+			autolinks.push(
+				...createIssueAutolinkReferences(team.key, `${organization.url}/issue/${team.key}-<num>`, organization),
+			);
 		}
 
 		// Not kept when built from teams read before the caches were dropped.
@@ -158,31 +165,61 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		return autolinks;
 	}
 
+	/** The workspace is the token's organization; kept only as a complete, trimmed pair. */
+	override async getProviderResourceForSession(
+		session: ProviderAuthenticationSession,
+	): Promise<ConnectionResource | undefined> {
+		const organization = await this.getOrganization(session, true);
+		const id = organization?.id.trim();
+		const name = organization?.name.trim();
+		return id && name ? { id: id, name: name } : undefined;
+	}
+
 	private _organizations: Map<string, LinearOrganizationDescriptor | undefined> | undefined;
+	/**
+	 * In flight by token. The request can't be aborted (provider-apis takes no signal), so a lookup that outlives its
+	 * caller's timeout is joined by the next one rather than piling another request on top of it.
+	 */
+	private readonly _organizationRequests = new Map<string, Promise<LinearOrganizationDescriptor | undefined>>();
 	private async getOrganization(
 		session: ProviderAuthenticationSession,
 		force: boolean = false,
 	): Promise<LinearOrganizationDescriptor | undefined> {
 		const { accessToken } = session;
-		this._organizations ??= new Map<string, LinearOrganizationDescriptor | undefined>();
+		// Held across the await: a re-sync drops `_organizations` meanwhile, and this read must still complete.
+		const organizations = (this._organizations ??= new Map<string, LinearOrganizationDescriptor | undefined>());
 
-		const cachedResources = this._organizations.get(accessToken);
+		const cachedResources = organizations.get(accessToken);
 
 		if (cachedResources == null || force) {
-			const api = await this.getProvidersApi();
-			const organization = await api.getLinearOrganization(toTokenWithInfo(this.id, session));
-			const descriptor: LinearOrganizationDescriptor | undefined = organization && {
+			let request = this._organizationRequests.get(accessToken);
+			if (request == null) {
+				request = this.fetchOrganization(session).finally(() => this._organizationRequests.delete(accessToken));
+				this._organizationRequests.set(accessToken, request);
+			}
+
+			const descriptor = await request;
+			if (descriptor) {
+				organizations.set(accessToken, descriptor);
+			}
+		}
+
+		return organizations.get(accessToken);
+	}
+
+	private async fetchOrganization(
+		session: ProviderAuthenticationSession,
+	): Promise<LinearOrganizationDescriptor | undefined> {
+		const api = await this.getProvidersApi();
+		const organization = await api.getLinearOrganization(toTokenWithInfo(this.id, session));
+		return (
+			organization && {
 				id: organization.id,
 				key: organization.key,
 				name: organization.name,
 				url: organization.url,
-			};
-			if (descriptor) {
-				this._organizations.set(accessToken, descriptor);
 			}
-		}
-
-		return this._organizations.get(accessToken);
+		);
 	}
 
 	/** Expires, and is dropped on a re-sync, so a team created or left mid-session is picked up (#5907). */
@@ -204,6 +241,19 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		if (cachedResources != null && !force) return { values: cachedResources };
 
 		const generation = this._teams.generation;
+		const read = await this.readTeams(session);
+		if (read?.metadata != null) return read;
+
+		if (read != null && this._teams.set(accessToken, read.values, { generation: generation })) {
+			// Built from the teams; a new set means new prefixes.
+			this._autolinks.delete(accessToken);
+		}
+		return read;
+	}
+
+	private async readTeams(
+		session: ProviderAuthenticationSession,
+	): Promise<ProviderApiCollectionResult<LinearTeamDescriptor> | undefined> {
 		const api = await this.getProvidersApi();
 		const teams = await api.getLinearTeamsForCurrentUser(toTokenWithInfo(this.id, session));
 		const descriptors: LinearTeamDescriptor[] | undefined = teams?.map(t => ({
@@ -222,17 +272,132 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 			return { values: descriptors, metadata: { completeness: 'unknown' } };
 		}
 
-		if (this._teams.set(accessToken, descriptors, { generation: generation })) {
-			// Built from the teams; a new set means new prefixes.
-			this._autolinks.delete(accessToken);
-		}
 		return { values: descriptors };
+	}
+
+	/**
+	 * The workspace's Linear Projects (Linear's `Project` entity), drained across their pages. Separate from the
+	 * teams this integration lists as its projects: a Linear Project can span several teams, and selecting one
+	 * narrows an issue read (`IssuesForProjectOptions.linearProjects`) rather than naming what is read.
+	 *
+	 * Cached like the teams, and only when complete: a drain cut short by its backstop or a failed page is returned
+	 * with its `truncated`/`metadata` so the facade can say so, and read again next time. A first-page failure
+	 * rejects, which the result wrapper turns into `{ error }`. `fresh` reads past the cache and any read in flight,
+	 * for a caller that must not take a list from before what it needs to see (a Project created since).
+	 */
+	@trace()
+	async getWorkspaceProjectsResult(
+		connectionId?: string,
+		options?: { fresh?: boolean },
+	): Promise<IntegrationResult<ProviderHierarchyResult<ProviderLinearProject>>> {
+		const scope = getScopedLogger();
+		// `connectionId` targets a specific account (multi-account); omitted reads the primary.
+		const session = await this.resolveReadSession(connectionId, scope);
+		if (session == null || isReadSessionFailure(session)) return session && { error: session.error };
+
+		try {
+			const projects = await this.getWorkspaceProjects(session, options?.fresh === true);
+			await this.confirmScopedAuthFailures(session, projects.metadata);
+			this.resetRequestExceptionCount('getProjectsForResources', connectionId);
+			return { value: projects };
+		} catch (ex) {
+			this.handleProviderException('getProjectsForResources', ex, { connectionId: connectionId });
+			return { error: toError(ex) };
+		}
+	}
+
+	/** Expires, and is dropped on a re-sync, so a Project created or archived mid-session is picked up. */
+	private readonly _workspaceProjects = new DiscoveryCache<ProviderLinearProject[]>();
+	/**
+	 * In flight by token, with the cache generation it started under: concurrent cold reads share one drain, but a
+	 * read after the cache was dropped (a `forceSync`) never joins one started before, which could miss what it asks
+	 * to see.
+	 */
+	private readonly _workspaceProjectsReads = new Map<
+		string,
+		{ generation: number; read: Promise<ProviderHierarchyResult<ProviderLinearProject>> }
+	>();
+	private getWorkspaceProjects(
+		session: ProviderAuthenticationSession,
+		fresh: boolean,
+	): Promise<ProviderHierarchyResult<ProviderLinearProject>> {
+		const { accessToken } = session;
+		const generation = this._workspaceProjects.generation;
+		if (!fresh) {
+			const cached = this._workspaceProjects.get(accessToken);
+			if (cached != null) return Promise.resolve({ values: cached });
+
+			const inFlight = this._workspaceProjectsReads.get(accessToken);
+			if (inFlight?.generation === generation) return inFlight.read;
+		}
+
+		const entry = { generation: generation, read: this.readWorkspaceProjects(session) };
+		entry.read = entry.read.then(result => {
+			if (
+				this._workspaceProjectsReads.get(accessToken) === entry &&
+				result.truncated !== true &&
+				(result.metadata == null || result.metadata.completeness === 'complete')
+			) {
+				this._workspaceProjects.set(accessToken, result.values, { generation: generation });
+			}
+			return result;
+		});
+		this._workspaceProjectsReads.set(accessToken, entry);
+		void entry.read
+			.finally(() => {
+				if (this._workspaceProjectsReads.get(accessToken) === entry) {
+					this._workspaceProjectsReads.delete(accessToken);
+				}
+			})
+			.catch(() => {});
+		return entry.read;
+	}
+
+	/**
+	 * Drains the Projects cursor up to {@link maxWorkspaceProjectPages}. A first-page failure rejects, so the read
+	 * fails as the team read does rather than reading as a workspace with no Projects; a later one keeps the prefix
+	 * and records the failure, as do a stalled cursor and the backstop with pages left.
+	 */
+	private async readWorkspaceProjects(
+		session: ProviderAuthenticationSession,
+	): Promise<ProviderHierarchyResult<ProviderLinearProject>> {
+		const api = await this.getProvidersApi();
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
+		let pagesRead = 0;
+		let firstPageError: Error | undefined;
+		const read = await collectProviderPagedResult(
+			async cursor => {
+				try {
+					const page = await api.getLinearProjects(tokenWithInfo, { cursor: cursor });
+					pagesRead++;
+					return page;
+				} catch (ex) {
+					if (pagesRead === 0) {
+						firstPageError = toError(ex);
+					}
+					throw ex;
+				}
+			},
+			maxWorkspaceProjectPages,
+			{ providerId: this.id },
+		);
+		// The drain records any failure against its scope and keeps the prefix; with no prefix, there is no list.
+		if (firstPageError != null) throw firstPageError;
+
+		return read;
 	}
 
 	protected override async getProviderResourcesForUser(
 		session: ProviderAuthenticationSession,
 	): Promise<ResourceDescriptor[] | undefined> {
 		const organization = await this.getOrganization(session);
+		return organization != null ? [organization] : undefined;
+	}
+	protected override async getProviderUncachedResourcesForUser(
+		session: ProviderAuthenticationSession,
+	): Promise<ResourceDescriptor[] | undefined> {
+		// Joins none in flight, unlike `getOrganization`: one may have started before what the caller needs to see.
+		const organization = await this.fetchOrganization(session);
 		return organization != null ? [organization] : undefined;
 	}
 	protected override getProviderProjectsForResources(
@@ -245,20 +410,61 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		session: ProviderAuthenticationSession,
 		_resources: ResourceDescriptor[],
 	): Promise<ProviderApiCollectionResult<ResourceDescriptor>> {
-		return (await this.getTeamsWithMetadata(session)) ?? { values: [] };
+		return (await this.getTeamsWithMetadata(session)) ?? { values: [], metadata: { completeness: 'unknown' } };
+	}
+	protected override async getProviderUncachedProjectsForResourcesWithMetadata(
+		session: ProviderAuthenticationSession,
+		_resources: ResourceDescriptor[],
+	): Promise<ProviderApiCollectionResult<ResourceDescriptor>> {
+		return (await this.readTeams(session)) ?? { values: [], metadata: { completeness: 'unknown' } };
 	}
 
-	override invalidateDiscoveryCaches(): void {
+	protected override clearDiscoveryCaches(): void {
 		this._organizations = undefined;
 		this._teams.clear();
+		this._workspaceProjects.clear();
+		this._workspaceProjectsReads.clear();
 		this._autolinks.clear();
+		this._recentAccounts.clear();
 	}
 	readonly authProvider: IntegrationAuthenticationProviderDescriptor = authProvider;
+
+	/**
+	 * Always asks Linear: the host's current-account cache decides when this runs. The viewer query is account-wide,
+	 * so the answer is lent briefly to the per-resource lookup a tracker read makes right after it.
+	 */
+	protected override async getProviderCurrentAccount(
+		session: ProviderAuthenticationSession,
+	): Promise<Account | undefined> {
+		const account = await this.fetchAccount(session);
+		if (account != null) {
+			this._recentAccounts.set(session.accessToken, Promise.resolve(account));
+		}
+		return account;
+	}
+
+	protected override getProviderUncachedAccountForResource(
+		session: ProviderAuthenticationSession,
+		_resource: ResourceDescriptor,
+	): Promise<Account | undefined> {
+		return this.fetchAccount(session);
+	}
 
 	protected override async getProviderAccountForResource(
 		session: ProviderAuthenticationSession,
 		_resource: ResourceDescriptor,
 	): Promise<Account | undefined> {
+		return this._recentAccounts.getOrCreate(session.accessToken, () => this.fetchAccount(session), {
+			evictWhen: account => account == null,
+		});
+	}
+
+	private readonly _recentAccounts = new PromiseCache<string, Account | undefined>({
+		capacity: 10,
+		createTTL: recentAccountTTL,
+	});
+
+	private async fetchAccount(session: ProviderAuthenticationSession): Promise<Account | undefined> {
 		const api = await this.getProvidersApi();
 		// Linear's viewer isn't a ProviderAccount (no username/avatar), so build the Account manually
 		// (Trello-style) from the fields the viewer query returns.
@@ -318,7 +524,8 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 			session,
 			{
 				teams: [project.id],
-				...(viewerId != null ? { assignees: [viewerId] } : {}),
+				...(options?.linearProjects?.length ? { projects: [...options.linearProjects] } : {}),
+				...(viewerId != null ? viewerScope(viewerId, options?.filters) : {}),
 				states: toProviderIssueStates(options?.state),
 			},
 			options?.sort,
@@ -331,16 +538,28 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 	}
 
 	/**
-	 * Searches every team of a user-scoped read together: one `getIssues` names all of them and the viewer as
-	 * assignee, so a team with none of the user's issues costs no request of its own. Linear's filter is a GraphQL
-	 * body, not a query string, so there is no key bound to chunk at.
+	 * Searches every team of a user-scoped read together: one `getIssues` names all of them and the viewer's scope
+	 * (see {@link viewerScope}), so a team with none of the user's issues costs no request of its own. Linear's filter
+	 * is a GraphQL body, not a query string, so there is no key bound to chunk at.
+	 *
+	 * A read narrowed to Linear Projects is searched together even across every assignee: the Projects already bound
+	 * it to a few teams' worth of issues, so a team holding none of them costs no request either. An unnarrowed read
+	 * of every assignee is still read team by team, since a search over all of them would just spend one team's page
+	 * budget before falling back.
 	 */
 	protected override getProjectIssuesSearches(
 		requests: readonly ProjectIssuesRequest<ResourceDescriptor>[],
 	): number[][] | undefined {
 		return groupProjectIssuesSearches(requests, ({ project, options }) =>
-			options.user != null && isIssueResourceDescriptor(project)
-				? [options.user, options.userId ?? '', options.sort ?? '', options.state ?? ''].join('\0')
+			(options.user != null || options.linearProjects?.length) && isIssueResourceDescriptor(project)
+				? [
+						options.user ?? '',
+						options.userId ?? '',
+						options.sort ?? '',
+						options.state ?? '',
+						options.filters?.join(',') ?? '',
+						...(options.linearProjects ?? []),
+					].join('\0')
 				: undefined,
 		);
 	}
@@ -349,13 +568,16 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		session: ProviderAuthenticationSession,
 		requests: readonly ProjectIssuesRequest<ResourceDescriptor>[],
 	): Promise<IssueShape[][] | undefined> {
-		// Every request of a search shares its user scope (see `getProjectIssuesSearches`).
+		// Every request of a search shares every option read here (see the key in `getProjectIssuesSearches`).
 		const { options } = requests[0];
-		if (options.user == null) return undefined;
-
-		// Unresolvable here means each team's own read throws the same warning, so let them.
-		const viewerId = await this.getViewerId(session, options);
-		if (viewerId == null) return undefined;
+		let viewerId: string | undefined;
+		if (options.user != null) {
+			// Unresolvable here means each team's own read throws the same warning, so let them.
+			viewerId = await this.getViewerId(session, options);
+			if (viewerId == null) return undefined;
+		} else if (!options.linearProjects?.length) {
+			return undefined;
+		}
 
 		const teams = requests.map(request => request.project).filter(isIssueResourceDescriptor);
 		if (teams.length !== requests.length) return undefined;
@@ -364,7 +586,8 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 			session,
 			{
 				teams: teams.map(team => team.id),
-				assignees: [viewerId],
+				...(options.linearProjects?.length ? { projects: [...options.linearProjects] } : {}),
+				...(viewerId != null ? viewerScope(viewerId, options.filters) : {}),
 				states: toProviderIssueStates(options.state),
 			},
 			options.sort,
@@ -418,16 +641,17 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 	 * Follows `getIssues`' cursor up to {@link maxPagesPerRequest}. `truncated` is set when that backstop stopped
 	 * the drain with more pages still available, when the provider stalled its cursor or flagged its paging as
 	 * truncated, or when a page after the first failed, which is recorded at `failureScope` while the prefix is
-	 * kept. A first-page failure throws, so the caller sees a hard error rather than an empty success.
+	 * kept. A failure before any issue was kept throws, so the caller sees a hard error rather than an empty success.
 	 */
 	private async drainIssues(
 		session: ProviderAuthenticationSession,
-		filter: { teams: string[]; assignees?: string[]; states?: GitIssueState[] },
+		filter: { teams: string[]; projects?: string[]; states?: GitIssueState[] } & Partial<LinearViewerScope>,
 		sort: IssuesForProjectOptions['sort'],
 		failureScope: CollectionScopeFailure['scope'],
 	): Promise<{ issues: IssueShape[]; truncated: boolean; metadata?: CollectionMetadata }> {
 		const api = await this.getProvidersApi();
 		const assignees = filter.assignees?.length ? filter.assignees : undefined;
+		const syncedCreators = filter.githubSyncedCreators?.length ? filter.githubSyncedCreators : undefined;
 		let cursor: string | undefined;
 		let hasMore: boolean;
 		let requestCount = 0;
@@ -442,6 +666,9 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 					sort: sort,
 				});
 			} catch (ex) {
+				// Keyed on what was kept, not on the page: provider-apis can empty a page it filters after the query
+				// (synced-creator reads) and still report more, and a drain that kept nothing has nothing to serve, so
+				// its caller retries it rather than recording an empty prefix as read.
 				if (issues.length === 0) throw ex;
 
 				truncated = true;
@@ -458,9 +685,19 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 			collectionMetadata = mergeCollectionMetadata(collectionMetadata, result.metadata);
 			for (const issue of result.values) {
 				const shape = toIssueShape(issue, this, { projection: 'project' });
-				// The query already scopes to the assignees; checking again keeps another user's issue out of "my
-				// issues" should the provider ever return one.
-				if (shape != null && (assignees == null || shape.assignees?.some(a => assignees.includes(a.id)))) {
+				// The read already scopes to the assignees and to the synced issues the creators filed, leaving out the
+				// issues with no GitHub sync link (`[]`) and keeping one whose link list Linear failed to resolve
+				// (absent). Checking again keeps another user's issue, or an unsynced one only its GitHub attachment
+				// matched, out of "my issues" should the provider ever return one.
+				if (
+					shape != null &&
+					(assignees == null ||
+						shape.assignees?.some(a => assignees.includes(a.id)) ||
+						(syncedCreators != null &&
+							shape.author != null &&
+							syncedCreators.includes(shape.author.id) &&
+							shape.syncedWith?.length !== 0))
+				) {
 					issues.push(shape);
 				}
 			}

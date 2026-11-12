@@ -72,7 +72,7 @@ provider.dispose();
 
 `GitService` key members:
 
-- `static createSingleton(watchingProvider?): GitService`
+- `static createSingleton(watchingProvider?, options?: { watchPolling?; readFile? }): GitService` — `watchPolling` (`WatchPollingOptions`) opts into polling what the provider reports it can't watch; `readFile(path): Promise<Uint8Array>` lets the watch service read the shared `.git/config` on each report of it and deliver a change confined to `branch.<name>` sections as confined to those branches (`WatcherRepoChangeEvent.configBranches`), which `createCliGitService` passes from `context.fs`
 - `register(provider, canHandle): UnifiedDisposable`
 - `forRepo(repoUri): RepositoryService | undefined`
 - `closeRepo(repoUri): void`
@@ -82,6 +82,8 @@ provider.dispose();
 - `hasProviders: boolean`
 - `etag: number` — monotonic counter for structural changes
 - `watchService: RepositoryWatchService | undefined`
+- `summaries: WorktreeSummaryService | undefined`
+- `onDidChangeMergeTargets: Event<MergeTargetsChangeEvent>`
 - Events: `onDidChangeProviders`
 - `dispose(): void`
 
@@ -167,6 +169,8 @@ interface CliGitProviderOptions {
 | `PreviousRangeComparisonUrisResult` | `providers/diff.js`     |
 | `BranchContributionsOverview`       | `providers/branches.js` |
 | `GitBranchMergedStatus`             | `providers/branches.js` |
+| `GitPushTarget`                     | `providers/branches.js` |
+| `GitPushTargetRef`                  | `providers/branches.js` |
 | `GitConfigKeys`                     | `providers/config.js`   |
 | `GkConfigKeys`                      | `providers/config.js`   |
 | `GitConfigType`                     | `providers/config.js`   |
@@ -196,7 +200,8 @@ Also on `GitProvider`:
 
 - `descriptor: GitProviderDescriptor` (`id: 'git' | 'github' | 'vsls'`, `name`, `virtual`)
 - URI helpers: `getAbsoluteUri()`, `getRelativePath()`
-- Optional repo methods: `excludeIgnoredUris?`, `getIgnoreFilter?`, `getIgnoredUrisFilter?`, `getLastFetchedTimestamp?`
+- Optional repo methods: `excludeIgnoredUris?`, `getIgnoreFilter?`, `getIgnoredDirectories?`, `getIgnoredUrisFilter?`, `getLastFetchedTimestamp?`, `getCommonPath?`
+- Optional events: `onDidChangeMergeTargets?`
 
 ---
 
@@ -233,17 +238,23 @@ Each sub-provider interface is defined in its own file under `providers/`:
 | `getBranches(repoPath, options?, cancellation?)`                                     | `PagedResult<GitBranch>`                   |
 | `getBranchContributionsOverview(repoPath, ref, options?, cancellation?)`             | `BranchContributionsOverview \| undefined` |
 | `getBranchesWithCommits(repoPath, shas, branch?, options?, cancellation?)`           | `string[]`                                 |
-| `getDefaultBranchName(repoPath, remote?, cancellation?)`                             | `string \| undefined`                      |
+| `getMergeTarget(repoPath, branch, options?, cancellation?)`                          | `MergeTarget \| undefined`                 |
+| `getDefaultBranchName(repoPath, remote?, options?, cancellation?)`                   | `string \| undefined`                      |
 | `createBranch?(repoPath, name, ref, options?)`                                       | `void`                                     |
 | `deleteLocalBranch?(repoPath, names, options?)`                                      | `void`                                     |
 | `deleteRemoteBranch?(repoPath, names, remote)`                                       | `void`                                     |
 | `getBranchMergedStatus?(repoPath, branch, into, cancellation?)`                      | `GitBranchMergedStatus`                    |
 | `getCurrentBranchReference?(repoPath, cancellation?)` _(internal)_                   | `GitBranchReference \| undefined`          |
 | `getLocalBranchByUpstream?(repoPath, remoteBranchName, cancellation?)`               | `GitBranch \| undefined`                   |
+| `getPushTarget?(repoPath, branch?, cancellation?)`                                   | `GitPushTarget`                            |
 | `getPotentialApplyConflicts?(repoPath, targetBranch, shas, options?, cancellation?)` | `ConflictDetectionResult`                  |
 | `getPotentialMergeConflicts?(repoPath, branch, targetBranch, cancellation?)`         | `ConflictDetectionResult`                  |
+| `getAheadOfBase?(repoPath, branch, options?, cancellation?)`                         | `AheadOfBase`                              |
+| `getAheadOfBaseConfigKey?(repoPath, cancellation?)`                                  | `string \| undefined`                      |
+| `getAheadOfBaseConfigEntries?(repoPath, cancellation?)`                              | `[key, value?][] \| undefined`             |
+| `getAheadOfBaseAfterBaseMove?(repoPath, branch, previous, moved, cancellation?)`     | `AheadOfBase \| undefined`                 |
 | `getBaseBranchName?(repoPath, ref, cancellation?)`                                   | `string \| undefined`                      |
-| `getStoredMergeTargetBranchName?(repoPath, ref)`                                     | `string \| undefined`                      |
+| `getStoredMergeTargetBranchName?(repoPath, ref, options?, cancellation?)`            | `string \| undefined`                      |
 | `getStoredDetectedMergeTargetBranchName?(repoPath, ref)`                             | `string \| undefined`                      |
 | `getStoredUserMergeTargetBranchName?(repoPath, ref)`                                 | `string \| undefined`                      |
 | `onCurrentBranchAccessed?(repoPath)`                                                 | `void`                                     |
@@ -379,16 +390,17 @@ Each sub-provider interface is defined in its own file under `providers/`:
 
 ### GitRefsSubProvider
 
-| Method                                                              | Returns                     |
-| ------------------------------------------------------------------- | --------------------------- |
-| `checkIfCouldBeValidBranchOrTagName(repoPath, ref)`                 | `boolean`                   |
-| `getMergeBase(repoPath, ref1, ref2, options?, cancellation?)`       | `string \| undefined`       |
-| `getReference(repoPath, ref, cancellation?)`                        | `GitReference \| undefined` |
-| `getSymbolicReferenceName?(repoPath, ref, options?, cancellation?)` | `string \| undefined`       |
-| `hasBranchOrTag(repoPath, options?, cancellation?)`                 | `boolean`                   |
-| `isValidReference(repoPath, ref, pathOrUri?, cancellation?)`        | `boolean`                   |
-| `validateReference(repoPath, ref, relativePath?, cancellation?)`    | `string \| undefined`       |
-| `updateReference(repoPath, ref, newRef, cancellation?)`             | `void`                      |
+| Method                                                                       | Returns                                           |
+| ---------------------------------------------------------------------------- | ------------------------------------------------- |
+| `checkIfCouldBeValidBranchOrTagName(repoPath, ref)`                          | `boolean`                                         |
+| `getMergeBase(repoPath, ref1, ref2, options?, cancellation?)`                | `string \| undefined`                             |
+| `getReference(repoPath, ref, cancellation?)`                                 | `GitReference \| undefined`                       |
+| `getSymbolicReferenceName?(repoPath, ref, options?, cancellation?)`          | `string \| undefined`                             |
+| `getSymbolicReferenceNameOrMissing?(repoPath, ref, options?, cancellation?)` | `{ name: string \| undefined; missing: boolean }` |
+| `hasBranchOrTag(repoPath, options?, cancellation?)`                          | `boolean`                                         |
+| `isValidReference(repoPath, ref, pathOrUri?, cancellation?)`                 | `boolean`                                         |
+| `validateReference(repoPath, ref, relativePath?, cancellation?)`             | `string \| undefined`                             |
+| `updateReference(repoPath, ref, newRef, cancellation?)`                      | `void`                                            |
 
 ### GitRemotesSubProvider
 
@@ -402,6 +414,7 @@ Each sub-provider interface is defined in its own file under `providers/`:
 | `getBestRemotesWithProviders(repoPath, cancellation?)`       | `GitRemote<RemoteProvider>[]`            |
 | `addRemote?(repoPath, name, url, options?)`                  | `void`                                   |
 | `addRemoteWithResult?(repoPath, name, url, options?)`        | `GitRemote \| undefined`                 |
+| `probeRemote?(repoPath, url, cancellation?)`                 | `GitRemoteProbeResult`                   |
 | `pruneRemote?(repoPath, name)`                               | `void`                                   |
 | `removeRemote?(repoPath, name)`                              | `void`                                   |
 | `setRemoteAsDefault(repoPath, name, value?)`                 | `void`                                   |
@@ -473,14 +486,14 @@ Each sub-provider interface is defined in its own file under `providers/`:
 
 ### GitWorktreesSubProvider
 
-| Method                                               | Returns                    |
-| ---------------------------------------------------- | -------------------------- |
-| `getWorktree(repoPath, predicate, cancellation?)`    | `GitWorktree \| undefined` |
-| `getWorktrees(repoPath, cancellation?)`              | `GitWorktree[]`            |
-| `getWorktreesDefaultUri(repoPath)`                   | `Uri \| undefined`         |
-| `createWorktree(repoPath, path, options?)`           | `void`                     |
-| `createWorktreeWithResult(repoPath, path, options?)` | `GitWorktree \| undefined` |
-| `deleteWorktree(repoPath, path, options?)`           | `void`                     |
+| Method                                                      | Returns                    |
+| ----------------------------------------------------------- | -------------------------- |
+| `getWorktree(repoPath, predicate, options?, cancellation?)` | `GitWorktree \| undefined` |
+| `getWorktrees(repoPath, options?, cancellation?)`           | `GitWorktree[]`            |
+| `getWorktreesDefaultUri(repoPath)`                          | `Uri \| undefined`         |
+| `createWorktree(repoPath, path, options?)`                  | `void`                     |
+| `createWorktreeWithResult(repoPath, path, options?)`        | `GitWorktree \| undefined` |
+| `deleteWorktree(repoPath, path, options?)`                  | `void`                     |
 
 ### GitBlameSubProvider
 
@@ -662,11 +675,15 @@ All in `remotes/`:
 
 ### Watching (`watching/`)
 
-| Export                   | Module                        | Description                             |
-| ------------------------ | ----------------------------- | --------------------------------------- |
-| `RepositoryWatchService` | `watching/watchService.js`    | Manages file watching sessions per repo |
-| `FileWatchingProvider`   | `watching/provider.js`        | Provider interface for file watching    |
-| `GitIgnoreFilter`        | `watching/gitIgnoreFilter.js` | Git ignore pattern filtering            |
+| Export                    | Module                        | Description                                 |
+| ------------------------- | ----------------------------- | ------------------------------------------- |
+| `RepositoryWatchService`  | `watching/watchService.js`    | Manages file watching sessions per repo     |
+| `FileWatchingProvider`    | `watching/provider.js`        | Provider interface for file watching        |
+| `FileWatcherReliability`  | `watching/provider.js`        | What a watcher reports it can see           |
+| `WatchPollingOptions`     | `watching/watchService.js`    | Opt-in polling of untrusted watchers        |
+| `GitIgnoreFilter`         | `watching/gitIgnoreFilter.js` | Git ignore pattern filtering                |
+| `WorktreeSummaryService`  | `watching/worktreeSummary.js` | Cached, change-notifying worktree state     |
+| `WorktreeSummarySnapshot` | `watching/worktreeSummary.js` | A summary with when its dirty flag was read |
 
 ### Parsers (`parsers/`)
 
@@ -724,6 +741,6 @@ const branches = await provider.branches.getBranches(repoPath, {}, controller.si
 
 ### `Cache.clearCaches` — `gitResults` cleared broadly
 
-The `gitResults` cache is added to `sharedCachesToClear` in nearly every type-specific invalidation branch (`branches`, `config`, `contributors`, `remotes`, `stashes`, `tags`, `worktrees`). This means almost any repository change event clears the entire git results cache.
+The `gitResults` cache is added to `sharedCachesToClear` in nearly every type-specific invalidation branch (`branches`, `config`, `contributors`, `remotes`, `stashes`, `tags`, `worktrees`). This means almost any repository change event clears the entire git results cache. The exception is `worktreeList`, which a bare `'worktrees'` change (a lock, unlock or move) maps to: it clears only the worktree list.
 
 **Investigation needed**: If `gitResults` is keyed granularly (per-command), the broad clearing may be overly aggressive and could be made more targeted to improve cache hit rates.

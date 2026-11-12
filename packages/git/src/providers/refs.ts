@@ -23,8 +23,9 @@ export interface GitRefsSubProvider {
 	): Promise<GitReference | undefined>;
 	/**
 	 * Reads `ref`'s reflog, newest first, optionally keeping only entries whose message matches `grep` (git's
-	 * `--grep-reflog` pattern). Resolves `[]` when nothing matches or `ref` has no reflog, and rejects when the
-	 * read fails (e.g. `ref` doesn't exist), so "no answer" is distinguishable from "never read".
+	 * `--grep-reflog` pattern, as a basic regular expression). Resolves `[]` when nothing matches or `ref` has no
+	 * reflog, and rejects when the read fails (e.g. `ref` doesn't exist), so "no answer" is distinguishable from
+	 * "never read".
 	 */
 	getReflogEntries?(
 		repoPath: string,
@@ -61,6 +62,13 @@ export interface GitRefsSubProvider {
 		options?: { priority?: GitCommandPriority },
 		cancellation?: AbortSignal,
 	): Promise<string | undefined>;
+	/** Like `getSymbolicReferenceName`, but `missing` is true only when git confirmed the ref doesn't exist; a read that didn't complete never reports missing. */
+	getSymbolicReferenceNameOrMissing?(
+		repoPath: string,
+		ref: string,
+		options?: { priority?: GitCommandPriority },
+		cancellation?: AbortSignal,
+	): Promise<{ name: string | undefined; missing: boolean }>;
 	hasBranchOrTag(
 		repoPath: string | undefined,
 		options?: {

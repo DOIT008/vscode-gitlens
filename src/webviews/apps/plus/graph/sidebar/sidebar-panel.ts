@@ -52,6 +52,7 @@ import {
 	describeAgentSession,
 	filterAgentSessionsForFamily,
 	getAgentSessionArchiveAction,
+	getAgentSessionKeplerAction,
 	getAgentSessionOpenActions,
 } from '../../../shared/agentUtils.js';
 import { shouldShowKeplerBanner } from '../../../shared/components/keplerBanner.utils.js';
@@ -1200,16 +1201,13 @@ would expose the graph through fade or at the gap left by the translate). */
 	/** Stands in for the pull-requests tree when the panel is empty for a reason the host can name — an
 	 *  empty list otherwise reads as "no open pull requests", which is the one thing it doesn't mean here. */
 	private renderPullRequestsEmptyState(emptyState: GraphSidebarPullRequestsEmptyState): unknown {
-		// One shape across the three connect reasons: lead with the connect action and the value it unlocks —
-		// for an unrecognized host, connecting a self-managed integration (with its domain) is what makes it
-		// recognized; with no remotes the tail names that publishing comes first.
+		// With no remotes there's nothing an integration could match yet, so publishing is the action to pitch.
 		if (emptyState.reason === 'no-remotes') {
-			return this.renderConnectPitch(
-				'Connect an integration to see and act on pull requests here once this repository is published to GitHub, GitLab, Azure DevOps, or Bitbucket.',
-				'Connect an Integration...',
-			);
+			return this.renderPublishPitch();
 		}
 
+		// One shape across the connect reasons: lead with the connect action and the value it unlocks — for an
+		// unrecognized host, connecting a self-managed integration (with its domain) is what makes it recognized.
 		if (emptyState.reason === 'no-supported-remote') {
 			return this.renderConnectPitch(
 				"Connect an integration — including self-managed hosts — to see this repository's pull requests and act on them without leaving the graph.",
@@ -1217,11 +1215,14 @@ would expose the graph through fade or at the gap left by the translate). */
 			);
 		}
 
-		// Connected and reachable, but the host has no repo-scoped pull request query GitLens can issue —
+		// Connected and reachable, but the remote doesn't name what the host's repo-scoped pull request query needs —
 		// so no Try Again, which would only land right back here.
 		if (emptyState.reason === 'unsupported') {
 			return html`<div class="empty">
-				GitLens can't list pull requests for ${emptyState.providerName} repositories yet.
+				${l10n.t(
+					"GitLens can't list pull requests for this {0} repository because its remote URL doesn't name a project.",
+					emptyState.providerName,
+				)}
 			</div>`;
 		}
 
@@ -1244,6 +1245,25 @@ would expose the graph through fade or at the gap left by the translate). */
 			>
 		</div>`;
 	}
+
+	private renderPublishPitch() {
+		return html`<div class="empty empty--connect">
+			<span
+				>${l10n.t(
+					'Publish this repository to GitHub, GitLab, Azure DevOps, or Bitbucket to see and act on its pull requests here.',
+				)}</span
+			>
+			<gl-button appearance="secondary" density="compact" @click=${this.handlePublishRepository}
+				><code-icon icon="cloud-upload" slot="prefix"></code-icon> ${l10n.t('Publish Repository…')}</gl-button
+			>
+		</div>`;
+	}
+
+	private readonly handlePublishRepository = () => {
+		// No args or context: the host's sidebar dispatch hands the command the graph's repo, and the command
+		// falls back to that repo's current branch.
+		this._actions?.executeAction('gitlens.publishRepository:graph');
+	};
 
 	private handleConnectIntegration(integrationId?: SupportedCloudIntegrationIds) {
 		// Not a row action, so it goes straight out rather than through `handleAction`'s per-panel action
@@ -2275,6 +2295,15 @@ would expose the graph through fade or at the gap left by the translate). */
 				label: openAction.label,
 				action: openAction.command,
 				arguments: openAction.args,
+			});
+		}
+		const keplerAction = getAgentSessionKeplerAction(session);
+		if (keplerAction != null) {
+			actions.push({
+				icon: keplerAction.icon,
+				label: keplerAction.label,
+				action: keplerAction.command,
+				arguments: keplerAction.args,
 			});
 		}
 		// Archive is offered only on terminal (ended) sessions — a live one would have to be
@@ -3397,9 +3426,11 @@ would expose the graph through fade or at the gap left by the translate). */
 			return;
 		}
 
-		let action: 'openSession' | 'resumeSession' | 'openPlanFile' | 'openTerminal' | undefined;
+		let action: 'openSession' | 'resumeSession' | 'openPlanFile' | 'openTerminal' | 'openInKepler' | undefined;
 		if (command === 'gitlens.agents.openSession') {
 			action = 'openSession';
+		} else if (command === 'gitlens.agents.openSessionInKepler') {
+			action = 'openInKepler';
 		} else if (command === 'gitlens.agents.resumeSession') {
 			action = 'resumeSession';
 		} else if (command === 'gitlens.agents.openPlanFile') {
