@@ -7,8 +7,8 @@ import type { IntegrationIds } from '../constants.js';
 import { supportedOrderedCloudIntegrationIds } from '../constants.js';
 import type { ProviderSweepTarget, PullRequestSweepOptions } from '../manager.js';
 import type { GitHostIntegration } from '../models/gitHostIntegration.js';
-import type { IntegrationResult } from '../models/integration.js';
 import type { IssuesIntegration } from '../models/issuesIntegration.js';
+import type { IntegrationResult } from '../models/publicIntegration.js';
 import type { PullRequestFilter } from '../providerFilters.js';
 import type { ProviderPullRequest, ProviderReposInput, ProviderRepository } from '../providers/models.js';
 import { getProviderPullRequestIdentity, pullRequestNamesPeople } from '../providers/models.js';
@@ -117,7 +117,7 @@ export async function drainPullRequests(
 	sweepOptions:
 		| Pick<
 				PullRequestSweepOptions,
-				'includeReviewRequested' | 'includeReviews' | 'scopeConcurrency' | 'includeRemoteInfo'
+				'includeReviewRequested' | 'includeReviews' | 'scopeConcurrency' | 'includeRemoteInfo' | 'mergeQueue'
 		  >
 		| undefined,
 	connectionId: string | undefined,
@@ -181,6 +181,7 @@ export async function drainPullRequests(
 							filters: filters,
 							// Lite by default; the full projection (reviews) only when a caller opts in.
 							summary: !includeReviews,
+							mergeQueue: sweepOptions?.mergeQueue,
 						},
 						connectionId,
 					)

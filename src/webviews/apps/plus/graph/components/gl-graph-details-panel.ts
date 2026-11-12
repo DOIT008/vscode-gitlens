@@ -131,9 +131,11 @@ import type {
 import type { BranchSheetRef } from './gl-graph-branch-sheet-pane.js';
 import type { RebaseSummaryViewDiffDetail } from './gl-rebase-summary-sheet.js';
 import type { ConflictSheetCommitEventDetail, ConflictSheetSideEventDetail } from './gl-wip-conflict-sheet.js';
+import { getQueuedPullRequestSheetNumbers } from './queuedPullRequestRecheck.js';
 import type { ReviewFindingCounts, ReviewProgress } from './reviewSession.js';
 import {
 	countReviewFindingStates,
+	getReviewFileProgress,
 	getReviewPanelStatus,
 	getReviewProgress,
 	getReviewReadingOrder,
@@ -289,6 +291,9 @@ declare global {
 		/** The sheet stack's kind composition changed — e.g. the app sizes the details pane for a
 		 *  rebase summary sheet opening or closing. */
 		'gl-graph-sheet-stack-change': CustomEvent<{ kinds: SheetKind[]; prevKinds: SheetKind[] }>;
+		/** The queued pull requests the open pull request sheets show changed — the app rechecks them until
+		 *  each leaves its merge queue. */
+		'gl-graph-queued-pr-sheets-change': CustomEvent<{ numbers: string[] }>;
 		/** {@link GlGraphDetailsPanel.minContentHeight} changed — the app re-clamps the bottom-docked
 		 *  details split so the pane can't sit below what fits the commit box and file-list floor. */
 		'gl-graph-details-min-height-changed': CustomEvent<void>;
@@ -1324,6 +1329,12 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		}
 	};
 
+	/** Re-reads the Working Changes pull request when it's the one a Graph action just changed (see
+	 *  {@link DetailsActions.refreshWipPullRequest}). */
+	refreshWipPullRequest(number: string): void {
+		this._actions?.refreshWipPullRequest(number);
+	}
+
 	/** Reflects a completed merge on every open pull request sheet the merge affects — the sheet stays
 	 *  up, it just stops claiming the pull request is open. Optimistic by design: the host's pull request
 	 *  cache still holds the pre-merge object, so a refetch would read back the stale state; a merge of
@@ -1353,6 +1364,39 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 				target: d.target,
 				pr: prMerged ? { ...pr, state: 'merged' } : pr,
 				layers: layers,
+				stackRoot: d.stackRoot,
+			};
+		});
+
+		if (changed) {
+			this._sheetStack = next;
+		}
+	}
+
+	/** Swaps a re-read pull request into every open pull request sheet that shows it — as the sheet's own pull
+	 *  request or one of its stack layers — after an action changed it (e.g. joining or leaving its merge queue). */
+	updatePullRequest(updated: GraphSidebarPullRequest): void {
+		let changed = false;
+
+		const next = this._sheetStack.map((d): SheetDescriptor => {
+			if (d.kind !== 'pullRequest' || d.pr == null) return d;
+
+			const isPr = d.pr.number === updated.number;
+			const inLayers = d.layers?.some(l => l.number === updated.number) === true;
+			if (!isPr && !inLayers) return d;
+
+			// The by-number read carries no Launchpad categorization; keep what the sheet had rather than lose it
+			const merge = (current: GraphSidebarPullRequest): GraphSidebarPullRequest =>
+				current.number === updated.number
+					? { ...updated, launchpad: updated.launchpad ?? current.launchpad }
+					: current;
+
+			changed = true;
+			return {
+				kind: 'pullRequest',
+				target: d.target,
+				pr: merge(d.pr),
+				layers: inLayers ? d.layers!.map(merge) : d.layers,
 				stackRoot: d.stackRoot,
 			};
 		});
@@ -1959,6 +2003,10 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	 *  `gl-graph-sheet-stack-change` exactly once per composition change, not once per render. */
 	private _prevSheetKinds: SheetKind[] = [];
 
+	/** The queued pull requests the open sheets showed at the last report, so {@link updated} reports a
+	 *  `gl-graph-queued-pr-sheets-change` only when the set changes. */
+	private _prevQueuedPullRequestSheetsKey = '';
+
 	/** Disposes the currently-registered overlay entry for the top-of-stack sheet — see
 	 *  {@link _sheetCoordinator}. */
 	private _sheetOverlayDisposable: Disposable | undefined;
@@ -2264,7 +2312,14 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		// entry-time commit's data. Compare's sheet floats over the panel and owns its own
 		// refs — selection changes underneath should still drive normal panel fetches so the
 		// underlying view (visible behind the inert sheet) stays current.
-		if (this._servicesResolved && this._actions != null && selectionChanged && !isLockedCommitRunningOperation) {
+		// A locked review's own commit selected in the graph (it moved onto a rewritten one) loads like any selection
+		const selectedLockedCommit = isLockedCommitRunningOperation && this.sha === this._state.activeModeSha.get();
+		if (
+			this._servicesResolved &&
+			this._actions != null &&
+			selectionChanged &&
+			(!isLockedCommitRunningOperation || selectedLockedCommit)
+		) {
 			if (this.isMultiCommit) {
 				void this._actions.fetchCompareDetails(this.shas, this.repoPath, this.commitLites);
 			} else {
@@ -2491,6 +2546,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		files: unknown;
 		order: unknown;
 		excluded: unknown;
+		viewed: unknown;
 		scope: unknown;
 		repoPath: unknown;
 		anchor: AnchorKey;
@@ -2508,6 +2564,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		const files = inReview ? this._actions.resources.scopeFiles.value.get() : undefined;
 		const order = inReview ? this._reviewReadingOrder : undefined;
 		const excluded = entry?.session?.excluded;
+		const viewed = entry?.session?.viewed;
 		const scope = this._state.scope.get();
 		const repoPath = this.effectiveRepoPath;
 		const anchor = this.engagedAnchorKey;
@@ -2517,6 +2574,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			synced.files === files &&
 			synced.order === order &&
 			synced.excluded === excluded &&
+			synced.viewed === viewed &&
 			synced.scope === scope &&
 			synced.repoPath === repoPath &&
 			synced.anchor === anchor
@@ -2527,7 +2585,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		const endpoints = getReviewDiffEndpoints(scope);
 		// The panel announces its order once rendered; until then the plan-then-path order stands in
 		const paths = inReview && files != null ? (order ?? getReviewReadingOrder(entry?.session, files)) : [];
-		if (paths.length === 0 || repoPath == null || endpoints == null) {
+		if (files == null || paths.length === 0 || repoPath == null || endpoints == null) {
 			if (synced != null) {
 				this._reviewFilesSynced = undefined;
 				this._actions.setReviewFiles(undefined);
@@ -2539,6 +2597,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			files: files,
 			order: order,
 			excluded: excluded,
+			viewed: viewed,
 			scope: scope,
 			repoPath: repoPath,
 			anchor: anchor,
@@ -2550,6 +2609,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			lhs: endpoints.lhs,
 			rhs: endpoints.rhs,
 			paths: [...paths],
+			viewed: files.filter(f => getReviewFileProgress(entry?.session, f) === 'viewed').map(f => f.path),
 		});
 	}
 
@@ -2573,6 +2633,10 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	override updated(changedProperties: Map<string, unknown>): void {
 		this.syncReviewThreads();
 		this.syncReviewFiles();
+		if (this._actions?.hasDeferredAnchorRewrite) {
+			this._actions.retryDeferredAnchorRewrite();
+		}
+		this.selectRewrittenCommit();
 		// Reads `wip`/`activeMode`/`sha` signals (also read in render), so this re-runs on every
 		// working-tree push and selection change — the lazy fetch is gated + deduped inside.
 		this.updateWipFileStats();
@@ -2606,6 +2670,21 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 				this.dispatchEvent(
 					new CustomEvent('gl-graph-sheet-stack-change', {
 						detail: { kinds: kinds, prevKinds: prevKinds },
+						bubbles: true,
+						composed: true,
+					}),
+				);
+			}
+
+			// The app rechecks a queued pull request on screen until it leaves its queue (merged, failed, removed),
+			// which nothing local would notice. Resolving, re-reading, and closing a sheet all land here.
+			const queued = getQueuedPullRequestSheetNumbers(this._sheetStack);
+			const queuedKey = queued.join(',');
+			if (queuedKey !== this._prevQueuedPullRequestSheetsKey) {
+				this._prevQueuedPullRequestSheetsKey = queuedKey;
+				this.dispatchEvent(
+					new CustomEvent('gl-graph-queued-pr-sheets-change', {
+						detail: { numbers: queued },
 						bubbles: true,
 						composed: true,
 					}),
@@ -2961,6 +3040,11 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		if (this.isWip) {
 			void this._actions.refetchWipQuiet(repoPath, true);
 			void this._actions.fetchBranchCommits(repoPath);
+		} else if (this.isLockedCommitRunningOperation && this._state.activeModeContext.get() === 'multicommit') {
+			// The review's own commits — a rewrite moves them, while the graph's two-row selection stays behind
+			void this._actions.fetchCompareDetails(this._state.activeModeShas.get(), repoPath);
+		} else if (this.isLockedCommitRunningOperation && this.sha !== this._state.activeModeSha.get()) {
+			// Another row picked under a locked commit review: the review's commit stays in the details
 		} else if (this.isMultiCommit) {
 			void this._actions.fetchCompareDetails(this.shas, repoPath, this.commitLites);
 		} else if (this.sha != null) {
@@ -3020,6 +3104,15 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		this._workflow = new DetailsWorkflowController(this, this._actions);
 		this._actions.reviewReadingHandler = state => this._workflow.review.applyReadingState(state);
 		this._actions.reviewThreadActionsHandler = state => this._workflow.review.applyThreadActions(state);
+		this._actions.anchorBusyHandler = repoPath => this._workflow.commitReviewsBusy(repoPath);
+		this._actions.commitReviewsHandler = repoPath => this._workflow.hasCommitReviews(repoPath);
+		this._actions.anchorRewrittenHandler = (history, repoPath) => {
+			const sha = this._workflow.followRewrittenHistory(history, repoPath);
+			if (sha != null) {
+				this._selectAfterRewrite = { sha: sha, rows: this._graphState?.rows, from: this.sha };
+				this.handleSelectCommit(sha);
+			}
+		};
 		this._actions.deepReviewHandler = state => this._workflow.review.applyDeepReviewState(state);
 
 		if (this._pendingCompare != null) {
@@ -4210,7 +4303,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 				)}
 			@review-deep-review-hide=${() => this._workflow.review.hideDeepReview()}
 			@review-reading-step=${(e: CustomEvent<ReviewReadingStepDetail>) =>
-				this._actions.stepReviewReading(e.detail.action, e.detail.path)}
+				this._actions.stepReviewReading(e.detail.action, e.detail.path, e.detail.inListOrder)}
 			@review-reading-order=${(e: CustomEvent<{ paths: string[] }>) => {
 				this._reviewReadingOrder = e.detail.paths;
 				this.requestUpdate();
@@ -4446,6 +4539,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		// Skip when the resolved selection is structurally unchanged — otherwise a benign items
 		// refresh (e.g. WIP tick) triggers redundant renders and a scopeFiles re-fetch.
 		if (scopeSelectionEqual(this._state.scope.get(), newScope)) return;
+		if (this._actions.holdScopeForRemap(newScope)) return;
 
 		this._state.scope.set(newScope);
 		if (this.effectiveRepoPath) {
@@ -4590,6 +4684,25 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			granularity: granularity,
 			instructions: instructions,
 		});
+	}
+
+	/** The commit a moved review asked the graph to select, and the rows it asked against */
+	private _selectAfterRewrite?: { sha: string; rows: unknown; from: string | undefined };
+
+	/** Asks again once the graph's rows have the commit — the first ask can come before the graph refreshed */
+	private selectRewrittenCommit(): void {
+		const pending = this._selectAfterRewrite;
+		if (pending == null) return;
+
+		const rows = this._graphState?.rows;
+		// Settled, moved on, or the reader picked another row meanwhile — the graph clearing its selection isn't a pick
+		const picked = this.sha != null && this.sha !== pending.from;
+		if (this.sha === pending.sha || picked || this._state.activeModeSha.get() !== pending.sha) {
+			this._selectAfterRewrite = undefined;
+		} else if (rows !== pending.rows && rows?.some(r => r.sha === pending.sha)) {
+			this._selectAfterRewrite = undefined;
+			this.handleSelectCommit(pending.sha);
+		}
 	}
 
 	private handleSelectCommit(sha: string) {

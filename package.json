@@ -2,7 +2,7 @@
 	"name": "gitlens",
 	"displayName": "%gitlens.displayName%",
 	"description": "%gitlens.description%",
-	"version": "19.5.0",
+	"version": "19.6.0",
 	"engines": {
 		"node": ">= 24",
 		"pnpm": ">= 11.0.0",
@@ -6341,6 +6341,16 @@
 				}
 			},
 			{
+				"id": "gitlens.queuedPullRequestIconColor",
+				"description": "%color.gitlens.queuedPullRequestIconColor.description%",
+				"defaults": {
+					"dark": "#d29922",
+					"light": "#9a6700",
+					"highContrast": "#d29922",
+					"highContrastLight": "#9a6700"
+				}
+			},
+			{
 				"id": "gitlens.mergedPullRequestIconColor",
 				"description": "%color.gitlens.mergedPullRequestIconColor.description%",
 				"defaults": {
@@ -8932,6 +8942,12 @@
 				"icon": "$(live-share)"
 			},
 			{
+				"command": "gitlens.kepler.install",
+				"title": "%command.gitlens.kepler.install.title%",
+				"category": "%command.category%",
+				"icon": "$(cloud-download)"
+			},
+			{
 				"command": "gitlens.kepler.newTask",
 				"title": "%command.gitlens.kepler.newTask.title%",
 				"icon": "$(gitlens-kepler)"
@@ -9721,6 +9737,13 @@
 				"enablement": "gitlens:review:reading"
 			},
 			{
+				"command": "gitlens.review.walkNextInListOrder",
+				"title": "%command.gitlens.review.walkNextInListOrder.title%",
+				"category": "%command.category%",
+				"icon": "$(arrow-small-right)",
+				"enablement": "gitlens:review:reading"
+			},
+			{
 				"command": "gitlens.review.walkPrevious",
 				"title": "%command.gitlens.review.walkPrevious.title%",
 				"category": "%command.category%",
@@ -9737,6 +9760,13 @@
 				"command": "gitlens.review.walkPrevious:key",
 				"title": "%command.gitlens.review.walkPrevious:key.title%",
 				"icon": "$(arrow-left)",
+				"enablement": "gitlens:review:reading"
+			},
+			{
+				"command": "gitlens.review.walkPreviousInListOrder",
+				"title": "%command.gitlens.review.walkPreviousInListOrder.title%",
+				"category": "%command.category%",
+				"icon": "$(arrow-small-left)",
 				"enablement": "gitlens:review:reading"
 			},
 			{
@@ -13554,6 +13584,13 @@
 					"fontPath": "dist/glicons.woff2",
 					"fontCharacter": "\\f15c"
 				}
+			},
+			"gitlens-provider-asana": {
+				"description": "provider-asana icon",
+				"default": {
+					"fontPath": "dist/glicons.woff2",
+					"fontCharacter": "\\f15d"
+				}
 			}
 		},
 		"menus": {
@@ -15147,6 +15184,10 @@
 					"when": "false"
 				},
 				{
+					"command": "gitlens.kepler.install",
+					"when": "!isWeb && !gitlens:kepler:installed && !gitlens:kepler:installing"
+				},
+				{
 					"command": "gitlens.kepler.newTask",
 					"when": "false"
 				},
@@ -15747,6 +15788,10 @@
 					"when": "false"
 				},
 				{
+					"command": "gitlens.review.walkNextInListOrder",
+					"when": "gitlens:review:reading"
+				},
+				{
 					"command": "gitlens.review.walkPrevious",
 					"when": "gitlens:review:reading"
 				},
@@ -15757,6 +15802,10 @@
 				{
 					"command": "gitlens.review.walkPrevious:key",
 					"when": "false"
+				},
+				{
+					"command": "gitlens.review.walkPreviousInListOrder",
+					"when": "gitlens:review:reading"
 				},
 				{
 					"command": "gitlens.reviewChanges:graph",
@@ -18490,17 +18539,19 @@
 				{
 					"command": "gitlens.review.walkPrevious:editor/title",
 					"when": "resource in gitlens:review:files",
-					"group": "navigation@-98"
+					"group": "navigation@-104",
+					"alt": "gitlens.review.walkPreviousInListOrder"
 				},
 				{
 					"command": "gitlens.review.markViewedAndNext:editor/title",
 					"when": "resource in gitlens:review:files",
-					"group": "navigation@-97"
+					"group": "navigation@-103"
 				},
 				{
 					"command": "gitlens.review.walkNext:editor/title",
 					"when": "resource in gitlens:review:files",
-					"group": "navigation@-96"
+					"group": "navigation@-102",
+					"alt": "gitlens.review.walkNextInListOrder"
 				},
 				{
 					"command": "gitlens.annotations.previousChange",
@@ -31304,7 +31355,6 @@
 		"@gitkraken/commit-graph-ui": "workspace:*",
 		"@gitkraken/compose-tools": "0.8.1",
 		"@gitkraken/conflict-tools": "0.2.3",
-		"@gitkraken/provider-apis": "catalog:",
 		"@gitkraken/shared-tools": "0.2.0",
 		"@gitlens/agents": "workspace:*",
 		"@gitlens/ai": "workspace:*",

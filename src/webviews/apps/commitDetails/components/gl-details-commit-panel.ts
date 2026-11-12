@@ -9,7 +9,7 @@ import type { IssueOrPullRequest } from '@gitlens/git/models/issueOrPullRequest.
 import type { PullRequestShape } from '@gitlens/git/models/pullRequest.js';
 import type { GitCommitReachability } from '@gitlens/git/providers/commits.js';
 import { formatIdentityDisplayName } from '@gitlens/git/utils/commit.utils.js';
-import { getPullRequestNumberFromUrl } from '@gitlens/git/utils/pullRequest.utils.js';
+import { getPullRequestDisplayStatus, getPullRequestNumberFromUrl } from '@gitlens/git/utils/pullRequest.utils.js';
 import { createReference } from '@gitlens/git/utils/reference.utils.js';
 import { getNumericFormat } from '@gitlens/utils/date.js';
 import { dispatchContextMenuAt } from '@gitlens/utils/dom.js';
@@ -854,6 +854,22 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		return html`<div class="autolinks">${this.renderAutoLinksChips()}</div>`;
 	}
 
+<<<<<<< HEAD
+=======
+	private renderEmbeddedExplainInput() {
+		if (!this.aiEnabled || this.orgSettings?.ai === false) return nothing;
+
+		return html`<gl-ai-input
+			multiline
+			floating-footer
+			.busy=${this.explainBusy}
+			@gl-explain=${this.onExplainChanges}
+		>
+			<gl-ai-model-chip slot="footer" .model=${this.aiModel}></gl-ai-model-chip>
+		</gl-ai-input>`;
+	}
+
+>>>>>>> upstream/main
 	private onToggleReachability() {
 		// Only allow expansion when there are refs to show
 		if (!this._reachabilityExpanded && !this.reachability?.refs?.length) return;
@@ -1073,12 +1089,14 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 			${when(prs.length, () =>
 				prs.map(pr => {
 					const prNumber = getPullRequestNumberFromUrl(pr.url) ?? pr.id;
+					const { status, queueStatus } = getPullRequestDisplayStatus(pr);
 					return html`<gl-autolink-chip
 						type="pr"
 						name="${pr.title}"
 						url="${pr.url}"
 						identifier="#${prNumber}"
-						status="${pr.state}"
+						status="${status}"
+						.queueStatus=${queueStatus}
 						.date=${pr.updatedDate}
 						.dateFormat="${this.preferences?.dateFormat}"
 						.dateStyle="${this.preferences?.dateStyle}"

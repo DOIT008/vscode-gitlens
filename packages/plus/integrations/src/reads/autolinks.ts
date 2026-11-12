@@ -2,7 +2,7 @@ import type { RefSet } from '@gitlens/git/models/autolink.js';
 import { isIncompleteCollection } from '../collectionMetadata.js';
 import { IssuesCloudHostIntegrationId, IssuesSelfManagedHostIntegrationId } from '../constants.js';
 import type { GetAutolinkReferencesOptions } from '../manager.js';
-import { isIssuesIntegration } from '../models/issuesIntegration.js';
+import { isIssuesIntegration } from '../models/publicIntegration.js';
 import { createIssueAutolinkReferences } from '../providers/utils/issueAutolinks.js';
 import type { ProviderReadContext } from './context.js';
 
@@ -28,7 +28,9 @@ export async function getAutolinkReferences(
 		return undefined;
 	} finally {
 		if (options.forceSync) {
-			// Completion retires reads started during the refresh, including when it failed.
+			// Not the refresh's own drop (`beginForcedRefresh`, before the sync): this one, at completion, retires the
+			// discovery reads other callers started while the refresh was pending, including when it failed, so a
+			// per-token catalog read with the token being replaced does not outlive the refresh the caller asked for.
 			integration.invalidateDiscoveryForConnection(options.connectionId);
 		}
 	}

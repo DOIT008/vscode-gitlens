@@ -1,15 +1,13 @@
 import type { PullRequest, PullRequestShape, PullRequestStateFilter } from '@gitlens/git/models/pullRequest.js';
 import { mergeAssessmentInto } from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
+import { isGitHostIntegration } from '../models/publicIntegration.js';
+import { PagingMode, providersMetadata } from '../providers/metadata.js';
 import type { ProviderPullRequest, ProviderReposInput, PullRequestFilter } from '../providers/models.js';
-import { PagingMode, providersMetadata, toPullRequestRow } from '../providers/models.js';
+import { toPullRequestRow } from '../providers/models.js';
 import type { ProviderPagedResult } from '../results.js';
 import { reconcileOmissionsWithFailure } from '../results.js';
-import {
-	isGitHostIntegration,
-	isIssuesHostIntegrationId,
-	warnOnMissingSessionForDomain,
-} from '../utils/integration.utils.js';
+import { isIssuesHostIntegrationId, warnOnMissingSessionForDomain } from '../utils/integration.utils.js';
 import type { ProviderReadContext } from './context.js';
 import { getPullRequestViewers, runCaptured } from './drains.js';
 import { resolveAccountWidePullRequestFilters, resolvePullRequestFilters } from './filters.js';
@@ -58,6 +56,8 @@ export async function listPullRequestsPage(
 		scopeConcurrency?: number;
 		/** See {@link IntegrationManager.listPullRequestsPage}. */
 		includeRemoteInfo?: boolean;
+		/** See {@link IntegrationManager.listPullRequestsPage}. Account-wide only: the repo-scoped read ignores it. */
+		mergeQueue?: boolean;
 		itemsPerPage?: number;
 		forceSync?: boolean;
 		connectionId?: string;
@@ -137,6 +137,7 @@ export async function listPullRequestsPage(
 		includeReviewRequested: options.includeReviewRequested ?? false,
 		filters: resolvedFilters.filters,
 		summary: true,
+		mergeQueue: options.mergeQueue,
 	};
 	// `filters` scopes the read to the current user (the core resolves the account for these), so it returns
 	// the user's PRs. `pageSize` rides along so PagingMode.Repo hosts (GitLab, Bitbucket, Bitbucket Data Center,

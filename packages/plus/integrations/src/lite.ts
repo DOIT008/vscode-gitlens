@@ -29,7 +29,7 @@ import type { ProviderApiConfig } from './providers/apiConfig.js';
 import { AzureDevOpsApi } from './providers/azure/azure.js';
 import { BitbucketApi } from './providers/bitbucket/bitbucket.js';
 import { GitLabApi } from './providers/gitlab/gitlab.js';
-import { providersMetadata } from './providers/models.js';
+import { providersMetadata } from './providers/metadata.js';
 
 /** The git-hosting integrations that expose a token-scoped read path here. */
 export type TokenScopedGitHostId =
@@ -193,10 +193,8 @@ function stripScheme(domain: string): string {
 }
 
 /**
- * GitHub's base URL, which `@gitkraken/provider-apis` derives BOTH the REST and the GraphQL endpoint from by
- * appending GitHub Enterprise's paths (`/api/v3`, `/api/graphql`). Cloud must therefore pass nothing rather than
- * `https://api.github.com`, which would build `https://api.github.com/api/graphql` and get a 404; omitting it is
- * what selects the cloud endpoints. Mirrors the cloud `GitHubIntegration.apiBaseUrlFor`.
+ * GitHub's base URL, which `@gitkraken/provider-apis` derives BOTH the REST and the GraphQL endpoint from. Omitting it
+ * is what selects the cloud endpoints, so cloud passes nothing. Mirrors the cloud `GitHubIntegration.apiBaseUrlFor`.
  */
 function resolveGitHubApiBaseUrl(
 	id: GitCloudHostIntegrationId.GitHub | GitSelfManagedHostIntegrationId.CloudGitHubEnterprise,

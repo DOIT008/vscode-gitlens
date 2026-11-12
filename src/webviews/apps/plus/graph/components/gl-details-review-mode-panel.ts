@@ -4,7 +4,7 @@ import { html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { keyed } from 'lit/directives/keyed.js';
 import { repeat } from 'lit/directives/repeat.js';
-import { isMac } from '@env/platform.js';
+import { getAltKeySymbol, isMac } from '@env/platform.js';
 import type {
 	AIReviewDetailResult,
 	AIReviewFinding,
@@ -111,6 +111,7 @@ import './gl-commits-scope-pane.js';
 export interface ReviewReadingStepDetail {
 	action: ReviewReadingAction;
 	path: string;
+	inListOrder?: boolean;
 }
 
 export interface ReviewOpenFileDetail {
@@ -1002,6 +1003,7 @@ export class GlDetailsReviewModePanel extends LitElement {
 								class="review-orient__button"
 								appearance="toolbar"
 								density="compact"
+								truncate
 								tooltip=${l10n.t(
 									'Orient: group and order the files with one line of context each — a map for your own read, not findings',
 								)}
@@ -1016,6 +1018,7 @@ export class GlDetailsReviewModePanel extends LitElement {
 								class="review-deep__button"
 								appearance="toolbar"
 								density="compact"
+								truncate
 								tooltip=${
 									this.deepReviewUnavailableReason ??
 									l10n.t(
@@ -1075,6 +1078,10 @@ export class GlDetailsReviewModePanel extends LitElement {
 	private withReadingShortcut(label: string, key: ReviewReadingAction): string {
 		const shortcut = this.readingShortcut(key);
 		return shortcut == null ? label : l10n.t('{label} ({shortcut})', { label: label, shortcut: shortcut });
+	}
+
+	private withListOrderClick(tooltip: string): string {
+		return l10n.t('{label} · [{key}] Click to Go in List Order', { label: tooltip, key: getAltKeySymbol() });
 	}
 
 	private onTreeOrderChanged(key: string, e: CustomEvent<{ paths: string[] }>): void {
@@ -1272,9 +1279,9 @@ export class GlDetailsReviewModePanel extends LitElement {
 			<gl-button
 				appearance="toolbar"
 				density="compact"
-				tooltip=${this.withReadingShortcut(l10n.t('Previous File in Review'), 'previous')}
+				tooltip=${this.withListOrderClick(this.withReadingShortcut(l10n.t('Previous File in Review'), 'previous'))}
 				aria-label=${l10n.t('Previous File in Review')}
-				@click=${() => this.handleReadingStep('previous', active)}
+				@click=${(e: MouseEvent) => this.handleReadingStep('previous', active, e)}
 			>
 				<code-icon icon="arrow-left"></code-icon>
 			</gl-button>
@@ -1289,9 +1296,9 @@ export class GlDetailsReviewModePanel extends LitElement {
 			<gl-button
 				appearance="toolbar"
 				density="compact"
-				tooltip=${this.withReadingShortcut(l10n.t('Next File in Review'), 'next')}
+				tooltip=${this.withListOrderClick(this.withReadingShortcut(l10n.t('Next File in Review'), 'next'))}
 				aria-label=${l10n.t('Next File in Review')}
-				@click=${() => this.handleReadingStep('next', active)}
+				@click=${(e: MouseEvent) => this.handleReadingStep('next', active, e)}
 			>
 				<code-icon icon="arrow-right"></code-icon>
 			</gl-button>
@@ -1359,10 +1366,10 @@ export class GlDetailsReviewModePanel extends LitElement {
 		</div>`;
 	}
 
-	private handleReadingStep(action: ReviewReadingAction, path: string): void {
+	private handleReadingStep(action: ReviewReadingAction, path: string, e?: MouseEvent): void {
 		this.dispatchEvent(
 			new CustomEvent<ReviewReadingStepDetail>('review-reading-step', {
-				detail: { action: action, path: path },
+				detail: { action: action, path: path, inListOrder: e?.altKey },
 				bubbles: true,
 				composed: true,
 			}),

@@ -301,8 +301,8 @@ export type ScopeFile = GitFileChangeShape & {
 	anchorSha?: string;
 	/** Resolved base (parent of the oldest included sha) of the range diff; absent for root-anchored ranges */
 	anchorBaseSha?: string;
-	/** Identity of the content under review — a blob id for working-tree/index files, the anchor sha for
-	 *  committed ones. A review session compares it to decide whether a viewed mark still holds. Absent
+	/** Identity of the content under review — the file's blob id in the working tree, the index or the
+	 *  range's tip commit. A review session compares it to decide whether a viewed mark still holds. Absent
 	 *  when the provider can't compute it (the mark then never goes stale). */
 	contentId?: string;
 };
@@ -392,6 +392,13 @@ export interface ReviewOpenFileArgs {
 	lineEnd?: number;
 }
 
+export interface RewrittenHistory {
+	mergeBase: string;
+	previous: { sha: string; message: string }[];
+	next: { sha: string; message: string }[];
+	patchIds?: Record<string, string>;
+}
+
 /** The files a review is reading: any of their diffs gets the reading commands (title buttons and
  *  keybindings), which step through them in this order. */
 export interface ReviewFilesArgs {
@@ -404,6 +411,8 @@ export interface ReviewFilesArgs {
 	rhs: string;
 	/** The files, in reading order. */
 	paths: string[];
+	/** The files marked viewed whose content hasn't moved on since — the reading steps pass them by. */
+	viewed: string[];
 }
 
 export type ReviewThreadState = 'open' | 'dismissed';
@@ -763,6 +772,18 @@ export interface GraphInspectService {
 		signal?: AbortSignal,
 	): Promise<BranchCommitsResult>;
 	getCommit(repoPath: string, sha: string, signal?: AbortSignal): Promise<CommitDetails | undefined>;
+	getCommitPatchIds(
+		repoPath: string,
+		shas: readonly string[],
+		signal?: AbortSignal,
+	): Promise<Record<string, string> | undefined>;
+	/** The commits from where `previousTip` and the branch tip part ways up to each, newest first, with their
+	 *  patch ids — what a rewrite replaced and what replaced it. `undefined` when they share no history. */
+	getRewrittenHistory(
+		repoPath: string,
+		previousTip: string,
+		signal?: AbortSignal,
+	): Promise<RewrittenHistory | undefined>;
 	getCompareDiff(repoPath: string, from: string, to: string, signal?: AbortSignal): Promise<CompareDiff | undefined>;
 	/**
 	 * Returns the active graph search context for the given commit (or `undefined` when no
@@ -833,9 +854,11 @@ export interface GraphInspectService {
 	/** Tells the host which files the review is reading, in order: their diffs get the editor keybindings
 	 *  and title buttons, and the host reports which one is active. `undefined` once the review is left. */
 	setReviewFiles(args: ReviewFilesArgs | undefined): Promise<void>;
+	/** The panel re-keyed a review (its commits were rewritten): what the host holds for it goes along */
+	moveReview(from: string, to: string, anchor: DeepReviewAnchor): Promise<void>;
 	/** Steps from `path` — or from the active editor's file when absent, which is what the editor
 	 *  keybindings and title buttons do. */
-	reviewStep(action: ReviewReadingAction, path?: string): Promise<void>;
+	reviewStep(action: ReviewReadingAction, path?: string, inListOrder?: boolean): Promise<void>;
 	/** Opens a review file's diff where the reading steps open theirs — beside an editor-hosted graph. */
 	openReviewFile(args: ReviewOpenFileArgs): Promise<void>;
 	/** The active review file and the editor-made viewed marks; `undefined` once the review is left. */
@@ -1069,9 +1092,12 @@ export interface GraphSidebarService {
 	/** Everything the pull request sheet renders, in one round trip — one pull request by number, or a
 	 *  whole stack by stack number. Deliberately NOT served off the pull requests panel's list: the sheet
 	 *  needs one pull request and its layers, not the repository's every open pull request, and waiting on
-	 *  that list is what used to make a stacked sheet take seconds or time out. */
+	 *  that list is what used to make a stacked sheet take seconds or time out. `fresh` reads the requested pull
+	 *  request past the host's cache (a recheck of one the sheet shows queued, which the cache would answer
+	 *  unchanged); it applies to the by-number target only. */
 	resolvePullRequestSheet(
-		target: { number: string } | { stackNumber: number },
+		target: { number: string; url?: string } | { stackNumber: number },
+		options?: { fresh?: boolean },
 	): Promise<GraphPullRequestSheetData | undefined>;
 	toggleLayout(panel: GraphSidebarPanel): void;
 	toggleShowRemoteBranches(): void;
@@ -1590,13 +1616,22 @@ export interface GraphPickersService {
 
 export interface GraphPullRequestService {
 	/** `number` is the user-facing PR number (not a provider-internal id). `confirmed` skips the
-	 *  host's own merge-blast-radius quickpick — set when the caller already confirmed in place. */
+	 *  host's own merge-blast-radius quickpick — set when the caller already confirmed in place; `queue` says
+	 *  that confirmation was for adding it to its merge queue. The host routes from a fresh read of the pull
+	 *  request — merging it, adding it to its merge queue where its base branch requires one, or offering the
+	 *  queue when it's already queued — and confirms again when that route isn't the one confirmed in place. */
 	merge(
 		number: string,
-		options?: { confirmed?: boolean; mergeMethod?: 'merge' | 'squash' | 'rebase' },
+		options?: { confirmed?: boolean; queue?: boolean; mergeMethod?: 'merge' | 'squash' | 'rebase' },
 	): Promise<MergePullRequestResult>;
+	/** Removes a queued pull request from its merge queue. `confirmed` skips the host's own confirmation — set when
+	 *  the caller already confirmed in place. Outcome and refreshes surface through the host. */
+	dequeue(number: string, options?: { confirmed?: boolean }): Promise<void>;
 	/** Rebases every branch of the pull request's stack, bottom to top. `ai` opts into AI conflict resolution. */
 	rebaseStack(number: string, options?: { ai?: boolean }): Promise<void>;
+	/** Fires with a pull request's number when the host learns its state moved under what the webview may show —
+	 *  a merge action's fresh read found it already queued, while the notice saying so still waits on the user. */
+	readonly onPullRequestChanged: RpcEventSubscription<{ number: string }>;
 }
 
 /** Row-level graph actions: the row-button menu (open changes, push-to-commit, stash, undo-commit),

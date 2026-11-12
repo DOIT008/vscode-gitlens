@@ -6,6 +6,8 @@ import type { IssueOrPullRequestState as PullRequestState } from '@gitlens/git/m
 import type {
 	PullRequest,
 	PullRequestMergeMethod,
+	PullRequestMergeQueueActionResult,
+	PullRequestMergeQueueEntry,
 	PullRequestSearchCriteria,
 	PullRequestShape,
 	PullRequestStackInfo,
@@ -21,6 +23,7 @@ import { gate } from '@gitlens/utils/decorators/gate.js';
 import { trace } from '@gitlens/utils/decorators/log.js';
 import { first } from '@gitlens/utils/iterable.js';
 import { Logger } from '@gitlens/utils/logger.js';
+import type { ScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import type { PagedResult } from '@gitlens/utils/paging.js';
 import { mapSettledBounded } from '@gitlens/utils/promise.js';
@@ -35,8 +38,10 @@ import {
 	unsettledMissMessage,
 } from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
-import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
+import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../constants.js';
 import { RequestNotFoundError, toError } from '../errors.js';
+import type { ProviderRepositoriesInput } from '../manager.js';
+import { PagingMode } from '../providers/metadata.js';
 import type {
 	GetIssuesOptions,
 	GetPullRequestsOptions,
@@ -53,9 +58,9 @@ import type {
 	ProviderRepository,
 } from '../providers/models.js';
 import {
+	fromProviderPullRequest,
 	isRepoIdsInput,
 	IssueFilter,
-	PagingMode,
 	PullRequestFilter,
 	toIssueShape,
 	toProviderIssueStates,
@@ -63,24 +68,35 @@ import {
 } from '../providers/models.js';
 import { isAzureProviderId } from '../providers/providerErrors.js';
 import type { ProvidersApi } from '../providers/providersApi.js';
-import { mergeCollectionMetadata, throwIfAllSettledFailed } from '../providers/utils/providerPaging.js';
+import {
+	mergeCollectionMetadata,
+	providerFanOutConcurrency,
+	throwIfAllSettledFailed,
+} from '../providers/utils/providerPaging.js';
+import type {
+	IssueEtagFields,
+	IssueEtagInclude,
+	PullRequestEtagFields,
+	PullRequestEtagInclude,
+} from '../reads/etag.js';
 import { areDomainsOnSameHost } from '../utils/domain.utils.js';
 import { getSelfManagedBaseUrl, isGitSelfManagedHostIntegrationId } from '../utils/integration.utils.js';
 import type {
 	BatchSlot,
-	IntegrationResult,
-	IntegrationType,
-	IssueEtagFields,
-	IssueEtagInclude,
 	ProviderIssueSearchPage,
 	ProviderPullRequestCount,
 	ProviderPullRequestSearchPage,
 	ProviderSearchCount,
-	PullRequestEtagFields,
-	PullRequestEtagInclude,
 } from './integration.js';
 import { IntegrationBase, isReadSessionFailure } from './integration.js';
 import type { MyIssuesForReposOptions } from './issueReads.js';
+import type {
+	GitHostIntegration as GitHostIntegrationView,
+	IntegrationResult,
+	MyPullRequestsForReposOptions,
+	SearchMyPullRequestsOptions,
+	SearchPullRequestsOptions,
+} from './publicIntegration.js';
 
 /**
  * Whether an SDK read for `providerId` must send the session's secret as an HTTP Basic credential.
@@ -97,50 +113,6 @@ function sendsBasicCredential(providerId: IntegrationIds, session: ProviderAuthe
 function resolveScopeConcurrency(value: number | undefined): number {
 	return value != null && Number.isFinite(value) && value >= 1 ? Math.trunc(value) : providerFanOutConcurrency;
 }
-
-/** Read options for {@link GitHostIntegration.searchMyPullRequests} and the provider hook behind it. */
-export type SearchMyPullRequestsOptions = {
-	/** Suppresses the user-facing notification when the read fails. */
-	silent?: boolean;
-	/**
-	 * PR states to include (open/closed/merged/all). Providers that cannot express it in a single query
-	 * filter the normalized results; omitted preserves the historical open-only behavior.
-	 */
-	state?: PullRequestStateFilter;
-	includeReviewRequested?: boolean;
-};
-
-/** Read options for {@link GitHostIntegration.searchPullRequests} and the provider hook behind it. */
-export type SearchPullRequestsOptions = {
-	/** PR states to include; omitted preserves the provider's default. */
-	include?: PullRequestState[];
-};
-
-type MyPullRequestsForReposOptions = {
-	filters?: PullRequestFilter[];
-	cursor?: string;
-	customUrl?: string;
-	page?: number;
-	pageSize?: number;
-	/** PR states to include; when omitted the provider returns its default (open only). */
-	state?: PullRequestStateFilter | PullRequestStateFilter[];
-	/** Requests the lightweight row shape without per-row build status or commit count. */
-	summary?: boolean;
-	/**
-	 * Most per-repository requests one provider read keeps in flight. Defaults to 6. Only hosts that read repository
-	 * by repository fan out — GitLab, GitLab self-managed, Bitbucket Cloud, Bitbucket Data Center and Azure DevOps;
-	 * GitHub/GHE send one query whatever the repo count. A value that isn't a finite number >= 1 falls back to the
-	 * default.
-	 */
-	scopeConcurrency?: number;
-	/**
-	 * Azure DevOps only, repo-scoped: `false` skips the lookup that fills each row's clone URLs, saving one
-	 * request per repository (and fork source) per page. Rows then carry no `refs.base.url`/`refs.head.url`
-	 * (empty) and no `cloneHttps`/`cloneSsh`, so leave it on for rows that will be checked out or matched to local
-	 * remotes. Defaults to `true`; other providers ignore it.
-	 */
-	includeRemoteInfo?: boolean;
-};
 
 /** A repository as the batch and branch reads name it. */
 export type RepositoryCoordinate = { owner: string; repo: string; project?: string };
@@ -209,8 +181,11 @@ const summaryPullRequestFields: Required<GitHubPullRequestFieldMap> = {
 export abstract class GitHostIntegration<
 	ID extends IntegrationIds = IntegrationIds,
 	T extends ResourceDescriptor = ResourceDescriptor,
-> extends IntegrationBase<ID> {
-	readonly type: IntegrationType = 'git';
+>
+	extends IntegrationBase<ID>
+	implements GitHostIntegrationView
+{
+	readonly type = 'git';
 
 	/** The self-managed installation `session` addresses, validated against this integration's host. */
 	protected getSelfManagedInstallationUrl(session: ProviderAuthenticationSession): string {
@@ -459,12 +434,16 @@ export abstract class GitHostIntegration<
 		return defaultBranch;
 	}
 
+	/**
+	 * Reads one repository. `readAt`, when set, is where it was read, which may not be where `repo` names it: an Azure
+	 * DevOps Server integration may read a remote's path as another collection and project than the remote parser did.
+	 */
 	getRepoInfo?(repo: {
 		owner: string;
 		name: string;
 		project?: string;
 		connectionId?: string;
-	}): Promise<ProviderRepository | undefined>;
+	}): Promise<(ProviderRepository & { readAt?: { owner: string; name: string; project?: string } }) | undefined>;
 
 	/**
 	 * Settles what one repository's refusal of the credential means, as a batch read settles a refused target (see
@@ -495,6 +474,16 @@ export abstract class GitHostIntegration<
 		repo: string,
 		cancellation?: AbortSignal,
 	): Promise<Map<number, PullRequestStackInfo> | undefined>;
+
+	/** Merge-queue entries for the given base branches of the repository, keyed by pull request number, for rows from a
+	 *  read that selects no merge queue. Only hosts with a readable merge queue implement this (currently GitHub.com);
+	 *  `undefined` means unavailable. INTERIM: remove once provider-apis carries the entry on its rows (goals S6). */
+	getMergeQueueEntriesByPullRequestNumber?(
+		owner: string,
+		repo: string,
+		branches: readonly string[],
+		cancellation?: AbortSignal,
+	): Promise<Map<number, PullRequestMergeQueueEntry> | undefined>;
 
 	/** The ordered layers of the stack the given pull request belongs to, bottom to top. `undefined`
 	 *  when the host has no stacks concept, the repository isn't enrolled, or the pull request isn't
@@ -826,6 +815,99 @@ export abstract class GitHostIntegration<
 		options?: { mergeMethod?: PullRequestMergeMethod },
 		cancellation?: AbortSignal,
 	): Promise<boolean>;
+
+	/**
+	 * Adds a pull request to its base branch's merge queue (where `mergeQueueRequired` says merging means queueing).
+	 * The result says why on failure: the host's refusal (`already-queued`, `head-changed`, `permission`, …),
+	 * `unsupported` where this host has no merge queue to act on (only GitHub.com's is), or `unknown` for anything
+	 * else, including no connection or a failure to reach the host — the provider's message rides along for logs, not
+	 * for display. Cancellation throws `CancellationError`. Evicts cached pull requests whatever the outcome, as
+	 * {@link mergePullRequest} does.
+	 */
+	@trace()
+	async enqueuePullRequest(pr: PullRequest, cancellation?: AbortSignal): Promise<PullRequestMergeQueueActionResult> {
+		const scope = getScopedLogger();
+		return this.runMergeQueueAction(
+			'enqueuePullRequest',
+			this.enqueueProviderPullRequest?.bind(this),
+			pr,
+			cancellation,
+			scope,
+		);
+	}
+
+	/**
+	 * Removes a queued pull request from its base branch's merge queue, losing its place there. Results, failures and
+	 * cancellation as {@link enqueuePullRequest}.
+	 */
+	@trace()
+	async dequeuePullRequest(pr: PullRequest, cancellation?: AbortSignal): Promise<PullRequestMergeQueueActionResult> {
+		const scope = getScopedLogger();
+		return this.runMergeQueueAction(
+			'dequeuePullRequest',
+			this.dequeueProviderPullRequest?.bind(this),
+			pr,
+			cancellation,
+			scope,
+		);
+	}
+
+	/** {@link mergePullRequest}'s session and failure handling, for the merge-queue actions. */
+	private async runMergeQueueAction(
+		syncReqUsecase: 'enqueuePullRequest' | 'dequeuePullRequest',
+		action:
+			| ((
+					session: ProviderAuthenticationSession,
+					pr: PullRequest,
+					cancellation?: AbortSignal,
+			  ) => Promise<PullRequestMergeQueueActionResult>)
+			| undefined,
+		pr: PullRequest,
+		cancellation: AbortSignal | undefined,
+		scope: ScopedLogger | undefined,
+	): Promise<PullRequestMergeQueueActionResult> {
+		if (action == null) return { status: 'failed', reason: 'unsupported' };
+
+		const sessionFailure = await this.prepareSessionLookup();
+		if (sessionFailure != null) {
+			return {
+				status: 'failed',
+				reason: 'unknown',
+				message: sessionFailure === 'unconnected' ? 'Not connected' : sessionFailure.message,
+			};
+		}
+
+		try {
+			const result = await action(this._session!, pr, cancellation);
+			this.resetRequestExceptionCount(syncReqUsecase);
+			return result;
+		} catch (ex) {
+			if (isCancellationError(ex)) throw ex;
+
+			const error = toError(ex);
+			this.handleProviderException(syncReqUsecase, error, { scope: scope });
+			return { status: 'failed', reason: 'unknown', message: error.message };
+		} finally {
+			// Joining or leaving a queue changes the pull request's queue state on the server, and a refusal may have
+			// raced a change made elsewhere, so cached pull requests can't be trusted either way.
+			this.ctx.cache.deletePullRequests();
+		}
+	}
+
+	/** Implemented only by hosts whose merge queue this integration can act on (currently GitHub.com); the base
+	 *  reports `unsupported` without one. */
+	protected enqueueProviderPullRequest?(
+		session: ProviderAuthenticationSession,
+		pr: PullRequest,
+		cancellation?: AbortSignal,
+	): Promise<PullRequestMergeQueueActionResult>;
+
+	/** See {@link enqueueProviderPullRequest}. */
+	protected dequeueProviderPullRequest?(
+		session: ProviderAuthenticationSession,
+		pr: PullRequest,
+		cancellation?: AbortSignal,
+	): Promise<PullRequestMergeQueueActionResult>;
 
 	@trace()
 	async getPullRequestForBranch(
@@ -1469,12 +1551,20 @@ export abstract class GitHostIntegration<
 		return { value: { ...value, values: values }, duration: result.duration };
 	}
 
+	/**
+	 * The current user's pull requests (or, without `filters`, every pull request) in `reposOrRepoIds`, one page at a
+	 * time; `undefined` when the read failed. {@link getMyPullRequestsForReposResult} keeps the error and the SDK's
+	 * collection metadata.
+	 */
 	async getMyPullRequestsForRepos(
-		reposOrRepoIds: ProviderReposInput,
+		reposOrRepoIds: ProviderRepositoriesInput,
 		options?: MyPullRequestsForReposOptions,
 		connectionId?: string,
-	): Promise<ProviderApiPagedResult<ProviderPullRequest> | undefined> {
-		return (await this.getMyPullRequestsForReposResult(reposOrRepoIds, options, connectionId))?.value;
+	): Promise<PagedResult<PullRequest> | undefined> {
+		const result = (await this.getMyPullRequestsForReposResult(reposOrRepoIds, options, connectionId))?.value;
+		if (result == null) return undefined;
+
+		return { paging: result.paging, values: result.values.map(pr => fromProviderPullRequest(pr, this)) };
 	}
 
 	/**
@@ -1864,6 +1954,10 @@ export abstract class GitHostIntegration<
 			filters?: PullRequestFilter[];
 			/** Request only the stable list fields, omitting optional provider enrichments. */
 			summary?: boolean;
+			/**
+			 * Selects merge-queue data on GitHub.com for this read, over the host's default; other providers ignore it.
+			 */
+			mergeQueue?: boolean;
 		},
 		connectionId?: string,
 	): Promise<IntegrationResult<ProviderApiPagedResult<ProviderPullRequest | PullRequest> | undefined>> {
@@ -1915,6 +2009,7 @@ export abstract class GitHostIntegration<
 			includeReviewRequested?: boolean;
 			filters?: PullRequestFilter[];
 			summary?: boolean;
+			mergeQueue?: boolean;
 		},
 	): Promise<ProviderApiPagedResult<ProviderPullRequest | PullRequest> | undefined>;
 
@@ -1984,6 +2079,8 @@ export abstract class GitHostIntegration<
 			pageSize?: number;
 			/** See {@link IntegrationManager.searchPullRequestsPage}. */
 			summary?: boolean;
+			/** See {@link IntegrationManager.searchPullRequestsPage}. */
+			mergeQueue?: boolean;
 		},
 		cancellation?: AbortSignal,
 		connectionId?: string,
@@ -2015,6 +2112,8 @@ export abstract class GitHostIntegration<
 			pageSize?: number;
 			/** See the caller's option of the same name on {@link searchPullRequestsPage}. */
 			summary?: boolean;
+			/** See the caller's option of the same name on {@link searchPullRequestsPage}. */
+			mergeQueue?: boolean;
 		},
 		cancellation?: AbortSignal,
 	): Promise<ProviderPullRequestSearchPage | undefined>;
@@ -2251,7 +2350,7 @@ export abstract class GitHostIntegration<
 	 */
 	async getPullRequestsBatchResult(
 		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
-		options?: { currentAccount?: { id: string; username?: string } },
+		options?: { currentAccount?: { id: string; username?: string }; mergeQueue?: boolean },
 		cancellation?: AbortSignal,
 		connectionId?: string,
 	): Promise<IntegrationResult<BatchSlot<PullRequestShape | undefined>[] | undefined>> {
@@ -2298,7 +2397,7 @@ export abstract class GitHostIntegration<
 	protected getProviderPullRequestsBatch?(
 		session: ProviderAuthenticationSession,
 		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
-		options: { currentAccount?: { id: string; username?: string } } | undefined,
+		options: { currentAccount?: { id: string; username?: string }; mergeQueue?: boolean } | undefined,
 		cancellation?: AbortSignal,
 	): Promise<PromiseSettledResult<PullRequestShape | undefined>[] | undefined>;
 
@@ -2371,7 +2470,7 @@ export abstract class GitHostIntegration<
 	 */
 	async getPullRequestsEtagFieldsResult(
 		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
-		options: { etagIncludes?: readonly PullRequestEtagInclude[] },
+		options: { etagIncludes?: readonly PullRequestEtagInclude[]; mergeQueue?: boolean },
 		cancellation?: AbortSignal,
 		connectionId?: string,
 	): Promise<IntegrationResult<BatchSlot<PullRequestEtagFields | undefined>[] | undefined>> {
@@ -2418,7 +2517,7 @@ export abstract class GitHostIntegration<
 	protected getProviderPullRequestsEtagFields?(
 		session: ProviderAuthenticationSession,
 		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
-		options: { etagIncludes?: readonly PullRequestEtagInclude[] },
+		options: { etagIncludes?: readonly PullRequestEtagInclude[]; mergeQueue?: boolean },
 		cancellation?: AbortSignal,
 	): Promise<PromiseSettledResult<PullRequestEtagFields | undefined>[] | undefined>;
 
@@ -2439,7 +2538,7 @@ export abstract class GitHostIntegration<
 	 */
 	async getPullRequestsForBranchesResult(
 		targets: readonly { owner: string; repo: string; project?: string; branch: string; headOwner?: string }[],
-		options: { currentAccount?: { id: string; username?: string }; limit: number },
+		options: { currentAccount?: { id: string; username?: string }; limit: number; mergeQueue?: boolean },
 		cancellation?: AbortSignal,
 		connectionId?: string,
 	): Promise<IntegrationResult<BatchSlot<{ pullRequests: PullRequestShape[]; truncated: boolean }>[] | undefined>> {
@@ -2491,13 +2590,14 @@ export abstract class GitHostIntegration<
 	 * A row matches only when its head branch is the target's `branch` AND its head repository is the base
 	 * repository itself (`headOwner` omitted) or the fork `headOwner` owns — a same-named branch in some other
 	 * fork is a different branch. A host that reads one target per request fans out with `mapSettledBounded`, so
-	 * one target's failure rejects only its own slot; GitHub/GHE alias up to 25 targets per request, and a request
-	 * that throws rejects only its own targets.
+	 * one target's failure rejects only its own slot; GitHub/GHE alias up to 25 distinct repository-and-branch queries
+	 * per request, each answering every target that names it, so a query's failure rejects all of those targets, and a
+	 * request that throws rejects only its own targets.
 	 */
 	protected getProviderPullRequestsForBranches?(
 		session: ProviderAuthenticationSession,
 		targets: readonly { owner: string; repo: string; project?: string; branch: string; headOwner?: string }[],
-		options: { currentAccount?: { id: string; username?: string }; limit: number },
+		options: { currentAccount?: { id: string; username?: string }; limit: number; mergeQueue?: boolean },
 		cancellation?: AbortSignal,
 	): Promise<PromiseSettledResult<{ pullRequests: PullRequestShape[]; truncated: boolean }>[] | undefined>;
 

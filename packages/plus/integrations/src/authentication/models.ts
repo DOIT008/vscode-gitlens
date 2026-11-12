@@ -214,6 +214,7 @@ export type CloudIntegrationType =
 	| 'jiraServer'
 	| 'linear'
 	| 'trello'
+	| 'asana'
 	| 'gitlab'
 	| 'github'
 	| 'bitbucket'
@@ -224,8 +225,6 @@ export type CloudIntegrationType =
 	| 'gitlabSelfHosted';
 
 export type CloudIntegrationAuthType = 'oauth' | 'pat';
-
-export const CloudIntegrationAuthenticationUriPathPrefix = 'did-authenticate-cloud-integration';
 
 /** Returns all supported cloud integration ids. */
 export function getSupportedCloudIntegrationIds(): readonly SupportedCloudIntegrationIds[] {
@@ -249,6 +248,7 @@ export const toIntegrationId: { [key in CloudIntegrationType]: IntegrationIds } 
 	jiraServer: IssuesSelfManagedHostIntegrationId.JiraServer,
 	linear: IssuesCloudHostIntegrationId.Linear,
 	trello: IssuesCloudHostIntegrationId.Trello,
+	asana: IssuesCloudHostIntegrationId.Asana,
 	gitlab: GitCloudHostIntegrationId.GitLab,
 	github: GitCloudHostIntegrationId.GitHub,
 	githubEnterprise: GitSelfManagedHostIntegrationId.CloudGitHubEnterprise,
@@ -264,6 +264,7 @@ export const toCloudIntegrationType: { [key in IntegrationIds]: CloudIntegration
 	[IssuesSelfManagedHostIntegrationId.JiraServer]: 'jiraServer',
 	[IssuesCloudHostIntegrationId.Linear]: 'linear',
 	[IssuesCloudHostIntegrationId.Trello]: 'trello',
+	[IssuesCloudHostIntegrationId.Asana]: 'asana',
 	[GitCloudHostIntegrationId.GitLab]: 'gitlab',
 	[GitCloudHostIntegrationId.GitHub]: 'github',
 	[GitCloudHostIntegrationId.Bitbucket]: 'bitbucket',

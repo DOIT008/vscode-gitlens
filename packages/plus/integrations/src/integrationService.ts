@@ -1,3 +1,4 @@
+import type { GitHubApi } from '@gitlens/git-github/api/github.js';
 import type { Account } from '@gitlens/git/models/author.js';
 import type { RefSet } from '@gitlens/git/models/autolink.js';
 import type { IssueSearchCriteria, IssueShape, IssueStateFilter } from '@gitlens/git/models/issue.js';
@@ -46,7 +47,6 @@ import {
 	GitSelfManagedHostIntegrationId,
 	IssuesCloudHostIntegrationId,
 	IssuesSelfManagedHostIntegrationId,
-	providerFanOutConcurrency,
 } from './constants.js';
 import type {
 	AuthenticationSessionsChangeEvent,
@@ -57,26 +57,21 @@ import { toError } from './errors.js';
 import type {
 	ClosedPullRequestSweepOptions,
 	GetAutolinkReferencesOptions,
+	IntegrationManager,
 	ListLinearProjectsOptions,
 	ListOrgsOptions,
 	ListProjectsOptions,
 	ProviderBroadenOrg,
 	PullRequestSweepOptions,
 } from './manager.js';
-import type { GitHostIntegration, SearchMyPullRequestsOptions } from './models/gitHostIntegration.js';
-import type {
-	Integration,
-	IntegrationBase,
-	IntegrationById,
-	IntegrationKey,
-	IntegrationResult,
-	IssueEtagInclude,
-	PullRequestEtagInclude,
-} from './models/integration.js';
+import type { GitHostIntegration } from './models/gitHostIntegration.js';
+import type { Integration, IntegrationBase, IntegrationById } from './models/integration.js';
 import type { IssuesIntegration } from './models/issuesIntegration.js';
+import type { IntegrationKey, IntegrationResult, SearchMyPullRequestsOptions } from './models/publicIntegration.js';
+import type { SupportedFilters } from './providerFilters.js';
 import type { ApiClients } from './providers/apiClients.js';
 import { createApiClients } from './providers/apiClients.js';
-import type { GitHubApi } from './providers/github/github.js';
+import { providersMetadata } from './providers/metadata.js';
 import type {
 	IssueFilter,
 	IssueSorting,
@@ -85,30 +80,20 @@ import type {
 	ProviderRepositoryShape,
 	PullRequestFilter,
 } from './providers/models.js';
-import { providersMetadata } from './providers/models.js';
 import type { ProvidersApi } from './providers/providersApi.js';
+import { providerFanOutConcurrency } from './providers/utils/providerPaging.js';
 import { getAutolinkReferences } from './reads/autolinks.js';
 import { broadenIssues } from './reads/broaden.js';
 import type { RepositoryResolutionContext } from './reads/context.js';
-import type {
-	IssueCountResult,
-	IssueCountScope,
-	PullRequestCountResult,
-	PullRequestCountScope,
-} from './reads/counts.js';
 import { countIssues, countPullRequests } from './reads/counts.js';
-import type { CurrentAccountResult } from './reads/currentAccount.js';
 import { getCurrentAccount } from './reads/currentAccount.js';
-import type { SupportedFilters } from './reads/filters.js';
+import type { IssueEtagInclude, PullRequestEtagInclude } from './reads/etag.js';
 import { getSupportedFilters } from './reads/filters.js';
 import { listLinearProjects, listOrgs, listProjects, listRepos } from './reads/hierarchy.js';
-import type { IssueBatchResult, IssueBatchTarget } from './reads/issueBatch.js';
 import { getIssuesBatch } from './reads/issueBatch.js';
 import { listIssuesPage } from './reads/issues.js';
 import { listIssueTrackerIssuesPage } from './reads/issueTracker.js';
-import type { PullRequestBatchResult, PullRequestBatchTarget } from './reads/pullRequestBatch.js';
 import { getPullRequestsBatch } from './reads/pullRequestBatch.js';
-import type { PullRequestBranchResult, PullRequestBranchTarget } from './reads/pullRequestBranches.js';
 import { getPullRequestsForBranches } from './reads/pullRequestBranches.js';
 import { listPullRequestsPage } from './reads/pullRequests.js';
 import { resolveRepository } from './reads/resolveRepository.js';
@@ -118,12 +103,23 @@ import { sweepClosedPullRequests, sweepPullRequests } from './reads/sweeps.js';
 import { noConnectionWarning } from './reads/warnings.js';
 import type {
 	ConnectionStateChangeEvent,
+	CurrentAccountResult,
+	IssueBatchResult,
+	IssueBatchTarget,
+	IssueCountResult,
+	IssueCountScope,
 	ProviderBroadenResult,
 	ProviderLinearProjectShape,
 	ProviderPagedResult,
 	ProviderResult,
 	ProviderSweepResult,
 	ProviderWarning,
+	PullRequestBatchResult,
+	PullRequestBatchTarget,
+	PullRequestBranchResult,
+	PullRequestBranchTarget,
+	PullRequestCountResult,
+	PullRequestCountScope,
 	ResolveRepositoryResult,
 } from './results.js';
 import type { Source } from './telemetry.js';
@@ -148,7 +144,7 @@ export interface IntegrationConnectionChangeEvent extends ConnectionStateChangeE
 const maxSmallIntegerV8 = 2 ** 30 - 1; // Max number that can be stored in V8's smis (small integers)
 const resourceLookupTimeoutMs = 10 * 1000;
 
-export class IntegrationService implements Disposable, RepositoryResolutionContext {
+export class IntegrationService implements Disposable, IntegrationManager, RepositoryResolutionContext {
 	get onDidChange(): Event<ConfiguredIntegrationsChangeEvent> {
 		return this.configuredIntegrationService.onDidChange;
 	}
@@ -216,16 +212,16 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 
 	@debug()
 	async connectCloudIntegrations(
-		connect?: { integrationIds: SupportedCloudIntegrationIds[]; skipIfConnected?: boolean; skipPreSync?: boolean },
+		options?: { integrationIds: SupportedCloudIntegrationIds[]; skipIfConnected?: boolean; skipPreSync?: boolean },
 		source?: Source,
 	): Promise<boolean> {
 		const scope = getScopedLogger();
-		const integrationIds = connect?.integrationIds;
+		const integrationIds = options?.integrationIds;
 		this.ctx.hooks?.connection?.onStarted?.({ integrationIds: integrationIds }, source);
 
 		const connectedIntegrations = new Set<string>();
 		if (integrationIds?.length) {
-			if (connect?.skipIfConnected && !connect?.skipPreSync) {
+			if (options?.skipIfConnected && !options?.skipPreSync) {
 				await this.syncCloudIntegrations(true);
 			}
 
@@ -245,7 +241,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 				}
 			}
 
-			if (connect?.skipIfConnected && connectedIntegrations.size === integrationIds.length) {
+			if (options?.skipIfConnected && connectedIntegrations.size === integrationIds.length) {
 				return true;
 			}
 		}
@@ -303,7 +299,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	): Promise<GitHostIntegration | undefined>;
 	get(id: GitSelfManagedHostIntegrationId, domain: string): Promise<GitHostIntegration | undefined>;
 	get<T extends IntegrationIds>(id: T, domain?: string): Promise<IntegrationById<T> | undefined>;
-	async get<T extends IntegrationIds>(id: T, domain?: string): Promise<IntegrationById<T> | undefined> {
+	async get(id: IntegrationIds, domain?: string): Promise<Integration | undefined> {
 		// Normalize to a bare host before anything keys off it. Callers pass a self-managed domain in both shapes
 		// — a full URL from a stored session/descriptor, a bare host from `hostFromDomain` — and the cache key is
 		// `${id}:${domain}`, so the same host arriving in two shapes would build two instances (and two
@@ -323,7 +319,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.authenticationService,
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
-					) as GitHostIntegration as IntegrationById<T>;
+					);
 					break;
 
 				case GitSelfManagedHostIntegrationId.CloudGitHubEnterprise:
@@ -345,7 +341,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 								this.getProvidersApi.bind(this),
 								this._onDidChangeIntegrationConnection,
 								configuredDomain,
-							) as GitHostIntegration as IntegrationById<T>;
+							);
 
 							// assign domain because it's part of caching key:
 							domain = configuredDomain;
@@ -363,7 +359,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
 						domain,
-					) as GitHostIntegration as IntegrationById<T>;
+					);
 					break;
 
 				case GitCloudHostIntegrationId.GitLab:
@@ -374,7 +370,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.authenticationService,
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
-					) as GitHostIntegration as IntegrationById<T>;
+					);
 					break;
 
 				case GitSelfManagedHostIntegrationId.CloudGitLabSelfHosted:
@@ -396,7 +392,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 								this.getProvidersApi.bind(this),
 								this._onDidChangeIntegrationConnection,
 								configuredDomain,
-							) as GitHostIntegration as IntegrationById<T>;
+							);
 
 							// assign domain because it's part of caching key:
 							domain = configuredDomain;
@@ -414,7 +410,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
 						domain,
-					) as GitHostIntegration as IntegrationById<T>;
+					);
 					break;
 
 				case GitCloudHostIntegrationId.Bitbucket:
@@ -425,7 +421,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.authenticationService,
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
-					) as GitHostIntegration as IntegrationById<T>;
+					);
 					break;
 
 				case GitSelfManagedHostIntegrationId.BitbucketServer:
@@ -447,7 +443,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 								this.getProvidersApi.bind(this),
 								this._onDidChangeIntegrationConnection,
 								configuredDomain,
-							) as GitHostIntegration as IntegrationById<T>;
+							);
 
 							// assign domain because it's part of caching key:
 							domain = configuredDomain;
@@ -465,7 +461,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
 						domain,
-					) as GitHostIntegration as IntegrationById<T>;
+					);
 					break;
 
 				case GitCloudHostIntegrationId.AzureDevOps:
@@ -476,7 +472,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.authenticationService,
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
-					) as GitHostIntegration as IntegrationById<T>;
+					);
 					break;
 
 				case GitSelfManagedHostIntegrationId.AzureDevOpsServer:
@@ -498,7 +494,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 								this.getProvidersApi.bind(this),
 								this._onDidChangeIntegrationConnection,
 								configuredDomain,
-							) as GitHostIntegration as IntegrationById<T>;
+							);
 
 							// assign domain because it's part of caching key:
 							domain = configuredDomain;
@@ -516,7 +512,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
 						domain,
-					) as GitHostIntegration as IntegrationById<T>;
+					);
 					break;
 
 				case IssuesCloudHostIntegrationId.Jira:
@@ -527,7 +523,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.authenticationService,
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
-					) as IssuesIntegration as IntegrationById<T>;
+					);
 					break;
 
 				case IssuesSelfManagedHostIntegrationId.JiraServer:
@@ -549,7 +545,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 								this.getProvidersApi.bind(this),
 								this._onDidChangeIntegrationConnection,
 								configuredDomain,
-							) as IssuesIntegration as IntegrationById<T>;
+							);
 
 							// assign domain because it's part of caching key:
 							domain = configuredDomain;
@@ -567,7 +563,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
 						domain,
-					) as IssuesIntegration as IntegrationById<T>;
+					);
 					break;
 
 				case IssuesCloudHostIntegrationId.Linear:
@@ -578,7 +574,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.authenticationService,
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
-					) as IssuesIntegration as IntegrationById<T>;
+					);
 					break;
 
 				case IssuesCloudHostIntegrationId.Trello:
@@ -589,10 +585,21 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 						this.authenticationService,
 						this.getProvidersApi.bind(this),
 						this._onDidChangeIntegrationConnection,
-					) as IssuesIntegration as IntegrationById<T>;
+					);
+					break;
+
+				case IssuesCloudHostIntegrationId.Asana:
+					integration = new (
+						await import(/* webpackChunkName: "integrations" */ './providers/asana.js')
+					).AsanaIntegration(
+						this.ctx,
+						this.authenticationService,
+						this.getProvidersApi.bind(this),
+						this._onDidChangeIntegrationConnection,
+					);
 					break;
 				default:
-					throw new Error(`Integration with '${id}' is not supported`);
+					throw new Error(`Integration with '${String(id)}' is not supported`);
 			}
 
 			this._integrations.set(this.getCacheKey(id, domain), integration);
@@ -913,6 +920,11 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	// failure degrades to a warning instead of failing the whole call. The reads are repo-scoped (they
 	// compose the git-host `*Result` cores); account-scoped fan-out is the adapter's responsibility.
 
+	/** The host's pull request read defaults (`ConfigProvider.getPullRequestReadOptions`), `{}` for a host with none. */
+	getPullRequestReadOptions(): { readonly mergeQueue?: boolean } {
+		return this.ctx.config.getPullRequestReadOptions?.() ?? {};
+	}
+
 	/**
 	 * Warnings for an early-returning read where the integration couldn't be resolved. When a specific
 	 * `connectionId` or self-managed `domain` was requested, a missing integration means that target is
@@ -1077,7 +1089,9 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	 * per-connection (`connectionId`) read syncs that specific connection's session directly through the auth
 	 * provider (the integration's primary-only sync path would never reach a secondary account), while a
 	 * primary read syncs via the integration's own cloud-connection machinery. Either way the integration's cached
-	 * discovery (a tracker's project list) is dropped, so the read sees projects created or deleted since.
+	 * discovery (a tracker's project list) is dropped as the sync starts (see `Integration.beginForcedRefresh`; on the
+	 * primary path, inside its session transition), so the read sees projects created or deleted since, even when the
+	 * sync fails.
 	 * Best-effort by default; strict discovery can require refresh success before trusting the resolved identity.
 	 */
 	async forceRefreshIfRequested(
@@ -1088,16 +1102,15 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	): Promise<void> {
 		if (forceSync !== true) return;
 
-		// Up front and unconditionally: the per-connection branch below re-syncs through the auth provider, which
-		// never reaches the integration's own re-sync that drops them, and a failed sync still has the read go ahead.
-		integration.invalidateDiscoveryForConnection(connectionId);
-
 		try {
 			if (connectionId != null) {
 				// Refresh the specific connection's session directly; the primary-only sync path below would not
 				// reach a secondary account. `cloud: true` is required for multi-account backend connections.
 				// Refetched rather than deleted first (see `GetSessionOptions.refetch`): a transient failure keeps the
 				// stored token, and only a definitive "no token" drops it.
+				// This re-sync never reaches `syncCloudConnection`, so the refresh is begun here, ahead of the
+				// `await`s that could fail.
+				integration.beginForcedRefresh(connectionId);
 				const authProvider = await this.authenticationService.get(integration.authProvider.id);
 				const descriptor = { ...integration.authProviderDescriptor, connectionId: connectionId, cloud: true };
 				const session = await authProvider?.getSession(descriptor, { sync: true, refetch: true });
@@ -1213,6 +1226,8 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		scopeConcurrency?: number;
 		/** See {@link IntegrationManager.listPullRequestsPage}. */
 		includeRemoteInfo?: boolean;
+		/** See {@link IntegrationManager.listPullRequestsPage}. */
+		mergeQueue?: boolean;
 	}): Promise<ProviderPagedResult<PullRequestShape>> {
 		return listPullRequestsPage(this, options);
 	}
@@ -1231,6 +1246,10 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		domain?: string;
 		/** See {@link IntegrationManager.searchPullRequestsPage}. */
 		summary?: boolean;
+		/** See {@link IntegrationManager.searchPullRequestsPage}. */
+		mergeQueue?: boolean;
+		/** See {@link IntegrationManager.searchPullRequestsPage}. */
+		cancellation?: AbortSignal;
 	}): Promise<ProviderPagedResult<PullRequestShape>> {
 		return searchPullRequestsPage(this, options);
 	}
@@ -1345,6 +1364,8 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		domain?: string;
 		/** Widens every etag to the listed inputs; see {@link IntegrationManager.getPullRequestsBatch}. */
 		etagIncludes?: readonly PullRequestEtagInclude[];
+		/** See {@link IntegrationManager.getPullRequestsBatch}. */
+		mergeQueue?: boolean;
 	}): Promise<ProviderResult<PullRequestBatchResult>> {
 		return getPullRequestsBatch(this, options);
 	}
@@ -1358,6 +1379,8 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		 * it must come from the trusted authentication configuration, not repository or remote data.
 		 */
 		domain?: string;
+		/** See {@link IntegrationManager.getPullRequestsForBranches}. */
+		mergeQueue?: boolean;
 	}): Promise<ProviderResult<PullRequestBranchResult>> {
 		return getPullRequestsForBranches(this, options);
 	}
@@ -1381,7 +1404,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	}
 
 	/**
-	 * Reads the user's issues from an issue-tracker provider (Jira/Linear/Trello), whose issues live under
+	 * Reads the user's issues from an issue-tracker provider (Jira/Linear/Trello/Asana), whose issues live under
 	 * resource → project (not repos), so they can't go through {@link listIssuesPage} (git-host, repo-scoped).
 	 * Returns the normalized {@link IssueShape} these providers produce, aggregated across the projects of the
 	 * given `org` (or every visible resource/project when omitted). `includeAllAssignees` drops the
@@ -1559,7 +1582,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	}
 
 	@debug()
-	async manageCloudIntegrations(source: Source | undefined): Promise<void> {
+	async manageCloudIntegrations(source?: Source): Promise<void> {
 		this.ctx.hooks?.connection?.onManaged?.(source);
 
 		// The host owns the GK-Dev manage interaction (sign-in if needed, open settings, wait for the user

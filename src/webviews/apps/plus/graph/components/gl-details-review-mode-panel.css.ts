@@ -45,7 +45,7 @@ export const reviewModePanelStyles = css`
 		align-items: center;
 		justify-content: center;
 		padding: var(--gl-space-8) var(--gl-space-12);
-		border-top: var(--gl-border-width) solid var(--gl-metadata-bar-border, var(--vscode-widget-border));
+		border-top: var(--gl-border-width) solid var(--gl-metadata-bar-border);
 	}
 
 	.review-footer__copy gl-button {
@@ -83,6 +83,10 @@ export const reviewModePanelStyles = css`
 		min-height: 0;
 		overflow: hidden;
 		--gl-split-panel-divider-width: 4px;
+		/* A pane's content starts where its header's title does, with the chevron hanging to the left of
+		   both — the title sits past the header's padding, the chevron and the gap; the content's own column
+		   (the check-all box, the overview, the focus areas) is already --gl-space-12 in */
+		--review-pane-title-inset: calc(var(--gl-space-2) + 16px + var(--gl-space-4));
 	}
 
 	.review-split__files,
@@ -91,13 +95,6 @@ export const reviewModePanelStyles = css`
 		flex-direction: column;
 		height: 100%;
 		overflow: hidden;
-	}
-
-	/* A pane's content starts where its header's title does, with the chevron hanging to the left of
-	   both — the title sits past the header's padding, the chevron and the gap; the content's own column
-	   (the check-all box, the overview, the focus areas) is already --gl-space-12 in */
-	.review-split {
-		--review-pane-title-inset: calc(var(--gl-space-2) + 16px + var(--gl-space-4));
 	}
 
 	.review-split__body {
@@ -172,7 +169,7 @@ export const reviewModePanelStyles = css`
 	}
 
 	.review-pane-header:focus-visible {
-		outline: 1px solid var(--vscode-focusBorder);
+		outline: 1px solid var(--gl-color-border-focus);
 		outline-offset: -1px;
 	}
 
@@ -223,10 +220,10 @@ export const reviewModePanelStyles = css`
 		min-width: 0;
 		margin-left: 2em;
 		overflow: hidden;
+		text-overflow: ellipsis;
 		font-size: var(--gl-font-sm);
 		color: var(--vscode-descriptionForeground);
 		text-align: right;
-		text-overflow: ellipsis;
 		white-space: nowrap;
 		direction: rtl;
 	}
@@ -251,7 +248,7 @@ export const reviewModePanelStyles = css`
 	}
 
 	.review-pane-header__toggle:focus-visible {
-		outline: 1px solid var(--vscode-focusBorder);
+		outline: 1px solid var(--gl-color-border-focus);
 		outline-offset: -1px;
 	}
 
@@ -260,10 +257,10 @@ export const reviewModePanelStyles = css`
 	.review-pane-header__description {
 		margin-left: calc(2em - var(--gl-space-4));
 		overflow: hidden;
+		text-overflow: ellipsis;
 		font-size: var(--gl-font-sm);
 		font-weight: 400;
 		color: var(--vscode-descriptionForeground);
-		text-overflow: ellipsis;
 		text-transform: none;
 		white-space: nowrap;
 	}
@@ -326,13 +323,13 @@ export const reviewModePanelStyles = css`
 		align-items: center;
 		padding: var(--gl-space-8) var(--gl-space-10);
 		margin: var(--gl-space-6) var(--gl-space-6) 0;
-		border: var(--gl-border-width) solid var(--vscode-button-border);
+		border: var(--gl-border-width) solid var(--gl-color-border-raised);
 		border-radius: var(--gl-radius-sm);
 	}
 
 	.review-done__icon {
 		font-size: var(--gl-font-lg);
-		color: var(--vscode-charts-green, #4ec9b0);
+		color: var(--gl-color-feedback-success-quiet-fg);
 	}
 
 	.review-done__body {
@@ -375,9 +372,9 @@ export const reviewModePanelStyles = css`
 
 	.review-walk__hint {
 		overflow: hidden;
+		text-overflow: ellipsis;
 		font-size: var(--gl-font-sm);
 		color: var(--vscode-descriptionForeground);
-		text-overflow: ellipsis;
 		white-space: nowrap;
 	}
 
@@ -392,12 +389,12 @@ export const reviewModePanelStyles = css`
 
 	.review-walk__file {
 		overflow: hidden;
+		text-overflow: ellipsis;
 		font-size: var(--gl-font-sm);
 		color: var(--vscode-descriptionForeground);
-		text-overflow: ellipsis;
+		text-align: left;
 		white-space: nowrap;
 		direction: rtl;
-		text-align: left;
 	}
 
 	.review-walk__actions {
@@ -413,6 +410,7 @@ export const reviewModePanelStyles = css`
 		/* One left edge for the whole document — the strip above it, the overview, every group's heading
 		   (its chevron sits 2px into the pane) and summary: the strip's own inset, margin + border + padding */
 		--review-document-inset: calc(var(--gl-space-6) + var(--gl-border-width) + var(--gl-space-10));
+
 		display: block;
 		padding-left: calc(var(--review-document-inset) - var(--gl-space-2));
 		overflow: auto;
@@ -470,10 +468,22 @@ export const reviewModePanelStyles = css`
 		gap: var(--gl-space-4);
 	}
 
+	/* The review input's footer holds the model chip plus Orient and Review in Repo: the chip keeps a
+	   floor and the buttons wrap whole (labels on one line) rather than squeezing into equal thirds. */
+	.review-action-input > gl-ai-model-chip {
+		flex: 1 1 10rem;
+	}
+
+	.review-action-input > gl-button[slot='footer'] {
+		flex: none;
+		max-width: 100%;
+		white-space: nowrap;
+	}
+
 	.review-orient__error {
 		padding: var(--gl-space-4) var(--gl-space-8);
 		font-size: var(--gl-font-sm);
-		color: var(--vscode-errorForeground);
+		color: var(--gl-color-feedback-danger-quiet-fg);
 	}
 
 	/* One-click scopes over the scope picker */
@@ -493,13 +503,19 @@ export const reviewModePanelStyles = css`
 		appearance: none;
 		cursor: pointer;
 		background: none;
-		border: var(--gl-border-width) solid var(--vscode-widget-border, var(--vscode-editorWidget-border));
+		border: var(--gl-border-width) solid var(--gl-color-action-secondary-border);
 		border-radius: var(--gl-radius-sm);
 	}
 
 	.scope-preset:hover {
 		color: var(--vscode-foreground);
-		background: var(--vscode-toolbar-hoverBackground);
+		background: var(--gl-color-action-quiet-bg-hover);
+	}
+
+	/* High-contrast hover cue; toolbar.hoverOutline is unset outside HC. Not while focused, so the focus ring wins */
+	.scope-preset:not(:disabled, :focus-visible):hover {
+		outline: var(--gl-border-width) dashed var(--gl-color-action-quiet-outline-hover);
+		outline-offset: -1px;
 	}
 
 	.scope-preset[aria-pressed='true'] {
@@ -509,7 +525,7 @@ export const reviewModePanelStyles = css`
 	}
 
 	.scope-preset:focus-visible {
-		outline: var(--gl-border-width) solid var(--vscode-focusBorder);
+		outline: var(--gl-border-width) solid var(--gl-color-border-focus);
 		outline-offset: 1px;
 	}
 
@@ -524,7 +540,7 @@ export const reviewModePanelStyles = css`
 		padding: var(--gl-space-4) var(--gl-space-12) 0;
 		font-size: var(--gl-font-sm);
 		color: var(--vscode-descriptionForeground);
-		border-top: var(--gl-border-width) solid var(--gl-metadata-bar-border, var(--vscode-widget-border));
+		border-top: var(--gl-border-width) solid var(--gl-metadata-bar-border);
 	}
 
 	.review-deep + .review-footer,
@@ -540,8 +556,8 @@ export const reviewModePanelStyles = css`
 	.review-finding__source {
 		padding: 0 var(--gl-space-3);
 		font-size: var(--gl-font-sm);
-		text-transform: uppercase;
 		color: var(--vscode-descriptionForeground);
+		text-transform: uppercase;
 		border: var(--gl-border-width) solid var(--vscode-descriptionForeground);
 		border-radius: var(--gl-radius-sm);
 	}
@@ -580,7 +596,7 @@ export const reviewModePanelStyles = css`
 		padding: var(--gl-space-8);
 		margin-bottom: var(--gl-space-8);
 		line-height: 1.5;
-		border: var(--gl-border-width) solid var(--vscode-panel-border, var(--vscode-widget-border, transparent));
+		border: var(--gl-border-width) solid var(--gl-color-border-raised);
 		border-radius: var(--gl-radius-sm);
 	}
 
@@ -604,7 +620,7 @@ export const reviewModePanelStyles = css`
 		align-items: center;
 		padding: 1.5rem 1rem;
 		font-weight: 500;
-		color: var(--vscode-charts-green, #4ec9b0);
+		color: var(--gl-color-feedback-success-quiet-fg);
 	}
 
 	/* Review areas */
@@ -635,7 +651,7 @@ export const reviewModePanelStyles = css`
 	.review-area {
 		margin-bottom: var(--gl-space-6);
 		overflow: hidden;
-		border: var(--gl-border-width) solid var(--vscode-panel-border, var(--vscode-widget-border, transparent));
+		border: var(--gl-border-width) solid var(--gl-color-border-raised);
 		border-radius: var(--gl-radius-sm);
 	}
 
@@ -655,11 +671,17 @@ export const reviewModePanelStyles = css`
 	}
 
 	.review-area__header:hover {
-		background: var(--vscode-list-hoverBackground);
+		background: var(--gl-color-action-quiet-bg-hover);
+	}
+
+	/* High-contrast hover cue; toolbar.hoverOutline is unset outside HC. Not while focused, so the focus ring wins */
+	.review-area__header:not(:disabled, :focus-visible):hover {
+		outline: var(--gl-border-width) dashed var(--gl-color-action-quiet-outline-hover);
+		outline-offset: -1px;
 	}
 
 	.review-area__header:focus-visible {
-		outline: var(--gl-border-width) solid var(--vscode-focusBorder);
+		outline: var(--gl-border-width) solid var(--gl-color-border-focus);
 		outline-offset: -0.1rem;
 	}
 
@@ -673,15 +695,15 @@ export const reviewModePanelStyles = css`
 	}
 
 	.review-area__severity--critical {
-		color: var(--vscode-editorError-foreground);
+		color: var(--gl-color-feedback-danger-quiet-fg);
 	}
 
 	.review-area__severity--warning {
-		color: var(--vscode-editorWarning-foreground);
+		color: var(--gl-color-feedback-warning-quiet-fg);
 	}
 
 	.review-area__severity--suggestion {
-		color: var(--vscode-editorInfo-foreground);
+		color: var(--gl-color-feedback-info-quiet-fg);
 	}
 
 	.review-area__label {
@@ -723,7 +745,7 @@ export const reviewModePanelStyles = css`
 		padding: var(--gl-space-2) var(--gl-space-4);
 		font-family: var(--vscode-editor-font-family);
 		font-size: var(--gl-font-base);
-		color: var(--vscode-textLink-foreground);
+		color: var(--gl-color-action-link-fg);
 		text-align: left;
 		cursor: pointer;
 		background: transparent;
@@ -758,7 +780,7 @@ export const reviewModePanelStyles = css`
 	.review-area__file-link-lines {
 		flex: 0 0 auto;
 		font-size: var(--gl-font-sm);
-		color: var(--color-foreground--50, var(--vscode-descriptionForeground));
+		color: var(--vscode-descriptionForeground);
 	}
 
 	.review-area__analyze-btn {
@@ -768,19 +790,19 @@ export const reviewModePanelStyles = css`
 		padding: var(--gl-space-4) var(--gl-space-8);
 		font-family: var(--vscode-font-family);
 		font-size: var(--gl-font-base);
-		color: var(--vscode-button-foreground);
+		color: var(--gl-color-action-primary-fg);
 		cursor: pointer;
-		background: var(--vscode-button-background);
+		background: var(--gl-color-action-primary-bg);
 		border: none;
 		border-radius: var(--gl-radius-sm);
 	}
 
 	.review-area__analyze-btn:hover {
-		background: var(--vscode-button-hoverBackground);
+		background: var(--gl-color-action-primary-bg-hover);
 	}
 
 	.review-area__analyze-btn:focus-visible {
-		outline: var(--gl-border-width) solid var(--vscode-focusBorder);
+		outline: var(--gl-border-width) solid var(--gl-color-border-focus);
 		outline-offset: 0.1rem;
 	}
 
@@ -796,17 +818,17 @@ export const reviewModePanelStyles = css`
 	}
 
 	.review-area__error {
-		color: var(--vscode-editorError-foreground);
+		color: var(--gl-color-feedback-danger-quiet-fg);
 	}
 
 	.review-area__clean {
-		color: var(--vscode-charts-green, #4ec9b0);
+		color: var(--gl-color-feedback-success-quiet-fg);
 	}
 
 	.review-area__retry-btn {
 		font-family: inherit;
 		font-size: inherit;
-		color: var(--vscode-textLink-foreground);
+		color: var(--gl-color-action-link-fg);
 		text-decoration: underline;
 		cursor: pointer;
 		background: transparent;
@@ -814,7 +836,7 @@ export const reviewModePanelStyles = css`
 	}
 
 	.review-area__retry-btn:focus-visible {
-		outline: var(--gl-border-width) solid var(--vscode-focusBorder);
+		outline: var(--gl-border-width) solid var(--gl-color-border-focus);
 		outline-offset: 0.1rem;
 		border-radius: var(--gl-radius-xs);
 	}
@@ -843,15 +865,15 @@ export const reviewModePanelStyles = css`
 	}
 
 	.review-finding[data-severity='critical'] {
-		border-left-color: var(--vscode-editorError-foreground);
+		border-left-color: var(--gl-color-feedback-danger-quiet-fg);
 	}
 
 	.review-finding[data-severity='warning'] {
-		border-left-color: var(--vscode-editorWarning-foreground);
+		border-left-color: var(--gl-color-feedback-warning-quiet-fg);
 	}
 
 	.review-finding[data-severity='suggestion'] {
-		border-left-color: var(--vscode-editorInfo-foreground);
+		border-left-color: var(--gl-color-feedback-info-quiet-fg);
 	}
 
 	/* The reader's own comment — no severity to color it by */
@@ -889,18 +911,21 @@ export const reviewModePanelStyles = css`
 	   tint follows the active theme. The prior hardcoded rgba(255,0,0,...) style produced
 	   clashes on themes whose error/warning/info hues aren't the default red/orange/blue. */
 	.review-finding__severity--critical {
-		color: var(--vscode-editorError-foreground);
-		background: color-mix(in srgb, var(--vscode-editorError-foreground) 12%, transparent);
+		color: var(--gl-color-feedback-danger-quiet-fg);
+		background: color-mix(in srgb, var(--gl-color-feedback-danger-quiet-fg) 12%, transparent);
+		border: var(--gl-border-width) solid var(--gl-color-feedback-danger-quiet-border);
 	}
 
 	.review-finding__severity--warning {
-		color: var(--vscode-editorWarning-foreground);
-		background: color-mix(in srgb, var(--vscode-editorWarning-foreground) 12%, transparent);
+		color: var(--gl-color-feedback-warning-quiet-fg);
+		background: color-mix(in srgb, var(--gl-color-feedback-warning-quiet-fg) 12%, transparent);
+		border: var(--gl-border-width) solid var(--gl-color-feedback-warning-quiet-border);
 	}
 
 	.review-finding__severity--suggestion {
-		color: var(--vscode-editorInfo-foreground);
-		background: color-mix(in srgb, var(--vscode-editorInfo-foreground) 12%, transparent);
+		color: var(--gl-color-feedback-info-quiet-fg);
+		background: color-mix(in srgb, var(--gl-color-feedback-info-quiet-fg) 12%, transparent);
+		border: var(--gl-border-width) solid var(--gl-color-feedback-info-quiet-border);
 	}
 
 	.review-finding__title {
@@ -929,8 +954,8 @@ export const reviewModePanelStyles = css`
 		display: flex;
 		flex-direction: column;
 		gap: var(--gl-space-4);
-		margin-bottom: var(--gl-space-6);
 		padding-left: var(--gl-space-8);
+		margin-bottom: var(--gl-space-6);
 		border-left: 2px solid color-mix(in srgb, transparent 70%, var(--vscode-descriptionForeground));
 	}
 
@@ -980,7 +1005,7 @@ export const reviewModePanelStyles = css`
 	}
 
 	.review-finding__reply-input:focus {
-		outline: 1px solid var(--vscode-focusBorder);
+		outline: 1px solid var(--gl-color-border-focus);
 		outline-offset: -1px;
 	}
 
@@ -990,7 +1015,7 @@ export const reviewModePanelStyles = css`
 		align-items: center;
 		font-family: var(--vscode-editor-font-family);
 		font-size: var(--gl-font-sm);
-		color: var(--vscode-textLink-foreground);
+		color: var(--gl-color-action-link-fg);
 		cursor: pointer;
 		background: transparent;
 		border: none;
@@ -1019,7 +1044,7 @@ export const reviewModePanelStyles = css`
 
 	.review-finding__location-lines {
 		flex: 0 0 auto;
-		color: var(--color-foreground--50, var(--vscode-descriptionForeground));
+		color: var(--vscode-descriptionForeground);
 	}
 
 	.review-findings__dismissed {
@@ -1033,11 +1058,11 @@ export const reviewModePanelStyles = css`
 	}
 
 	.review-findings__dismissed:hover {
-		color: var(--vscode-textLink-foreground);
+		color: var(--gl-color-action-link-fg);
 	}
 
 	.review-findings__dismissed:focus-visible {
-		outline: var(--gl-border-width) solid var(--vscode-focusBorder);
+		outline: var(--gl-border-width) solid var(--gl-color-border-focus);
 		outline-offset: -0.1rem;
 		border-radius: var(--gl-radius-xs);
 	}
