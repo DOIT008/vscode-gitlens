@@ -38,6 +38,8 @@ import { detailsBaseStyles } from './gl-details-base.css.js';
 import type { File } from './gl-details-base.js';
 import { GlDetailsBase } from './gl-details-base.js';
 import { detailsCommitPanelStyles } from './gl-details-commit-panel.css.js';
+import '../../shared/components/ai-input.js';
+import '../../shared/components/gl-ai-model-chip.js';
 import '../../shared/components/branch-name.js';
 import '../../shared/components/button.js';
 import '../../shared/components/chips/action-chip.js';
@@ -337,7 +339,7 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 										<div slot="start" class="msg-slot">${this.renderEmbeddedMessage()}</div>
 										<div slot="divider" class="split__handle"></div>
 										<div slot="end" class="bottom-section">
-											${this.renderEmbeddedAutolinks()}
+											${this.renderEmbeddedAutolinks()} ${this.renderEmbeddedExplainInput()}
 											<div class="files">
 												<webview-pane-group flexible>
 													${this.renderChangedFiles(fileMode, renderOpts)}
@@ -854,8 +856,6 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		return html`<div class="autolinks">${this.renderAutoLinksChips()}</div>`;
 	}
 
-<<<<<<< HEAD
-=======
 	private renderEmbeddedExplainInput() {
 		if (!this.aiEnabled || this.orgSettings?.ai === false) return nothing;
 
@@ -869,7 +869,6 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		</gl-ai-input>`;
 	}
 
->>>>>>> upstream/main
 	private onToggleReachability() {
 		// Only allow expansion when there are refs to show
 		if (!this._reachabilityExpanded && !this.reachability?.refs?.length) return;
@@ -1280,6 +1279,23 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 				</div>
 			</div>
 		</gl-popover>`;
+	}
+
+	private onExplainChanges(e: CustomEvent<{ prompt?: string }> | MouseEvent) {
+		if (this.explainBusy) {
+			e.preventDefault();
+			e.stopPropagation();
+			return;
+		}
+
+		e.stopPropagation();
+		this.explainBusy = true;
+
+		const prompt = e instanceof CustomEvent ? e.detail?.prompt : undefined;
+
+		this.dispatchEvent(
+			new CustomEvent('explain-commit', { detail: { prompt: prompt }, bubbles: true, composed: true }),
+		);
 	}
 
 	override getFileActions(file: File, _options?: Partial<TreeItemBase>): TreeItemAction[] {
